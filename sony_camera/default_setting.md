@@ -1,0 +1,13 @@
+- Mode: M
+    - ISO: manually controlled by script
+    - Shutter Speed: manually controlled by script
+    - Aperture: manually controlled by script
+
+- White Balance: fixed Kelvin, 5600K
+- Creative Look: Neutral or Standard, fixed
+- Picture Profile: Off
+- Drive Mode: Single
+- Zoom / focal length: fixed at ...
+- Focus: MF
+    - AF Illuminator: OFF
+    - 

@@ -6,14 +6,14 @@ Run from the repository root, usually through the Sony camera launcher::
 
 Useful dry run for checking the capture plan and filenames::
 
-    python control.py --dry-run --class-name test_object
+    python control.py --dry-run
 
 Default plan:
-    lighting intensities: 5
+    lighting intensities: 10, 50
     views: 0, 90, 180, 270 degrees
-    apertures: F2.8, F10
-    ISO: 250, 800, 5000
-    shutter speeds: 1/100, 1/1000
+    apertures: F3.2
+    ISO: 800
+    shutter speeds: 1/80
 """
 
 from __future__ import annotations
@@ -22,35 +22,69 @@ import argparse
 import asyncio
 import base64
 import csv
+import glob
 import json
 import os
-import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 
 DEFAULT_OUTPUT_DIR = Path("sony_camera/captures/dataset")
 DEFAULT_TURNTABLE_PORT = "/dev/cu.usbmodem1101"
-DEFAULT_LIGHT_INTENSITIES = [10, 50]
-DEFAULT_APERTURES = [3.2]
-DEFAULT_ISOS = [800]
-DEFAULT_SHUTTERS = [ "1/80"]
+DEFAULT_CCT = 5600
+DEFAULT_LIGHT_INTENSITIES = [0, 10, 50, 300, 500, 700, 1000]
+DEFAULT_APERTURES = [2.8, 4, 8, 13, 16, 22]
+DEFAULT_ISOS = [100, 250, 800, 2000, 3200, 6400, 12800, 32000]
+DEFAULT_SHUTTERS = ['0.5"', "1/3", "1/15", "1/60", "1/250", "1/1000"]
+DEFAULT_SAVE_MEDIA = "host"
+DEFAULT_START_DELAY_SECONDS = 10.0
+PAD_WIDTH = 3
 
-CSV_FIELDS = [
+CLASS_FIELDS = [
+    "class_id",
+    "class_folder",
+    "created_at",
+]
+SAMPLE_FIELDS = [
+    "class_id",
+    "sample_id",
+    "class_folder",
+    "sample_folder",
     "session_id",
-    "sequence",
-    "class_name",
-    "file_name",
-    "image_path",
-    "light_intensity",
+    "created_at",
+    "total_captures",
+]
+LIGHT_FIELDS = [
+    "light_id",
+    "light_folder",
+    "intensity",
     "light_percent",
     "cct",
+]
+VIEW_FIELDS = [
+    "view_id",
+    "view_folder",
     "view_index",
     "angle_degrees",
+]
+PARAM_FIELDS = [
+    "param_id",
+    "param_file",
     "aperture",
     "iso",
     "shutter_speed",
+]
+IMAGE_FIELDS = [
+    "session_id",
+    "sequence",
+    "class_id",
+    "sample_id",
+    "light_id",
+    "view_id",
+    "param_id",
+    "image_path",
     "captured_at",
 ]
 
@@ -81,23 +115,30 @@ def parse_shutter_list(value: str) -> list[str]:
     return shutters
 
 
-def slugify(value: str) -> str:
-    value = re.sub(r"\s+", "_", value.strip())
-    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
-    value = value.strip("._-")
-    return value or "class"
-
-
-def aperture_label(value: float) -> str:
-    return f"{value:g}".replace(".", "p")
-
-
-def shutter_file_label(value: str) -> str:
-    return value.replace("/", "-").replace(".", "p")
-
-
 def light_percent(intensity: int) -> float:
+    """
+    This function is only for reading purpose
+    Real control still use the original intensity [0, 1000]
+    """
     return intensity / 10.0
+
+
+def make_session_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+
+def timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def format_id(prefix: str, value: int) -> str:
+    return f"{prefix}{value:0{PAD_WIDTH}d}"
+
+
+def format_number(value: float | int | str) -> str:
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
 
 
 def restore_owner(path: Path) -> None:
@@ -109,37 +150,230 @@ def restore_owner(path: Path) -> None:
     os.chown(path, int(uid_text), int(gid_text))
 
 
-def append_manifest_row(manifest_path: Path, row: dict[str, object]) -> None:
-    file_exists = manifest_path.exists()
-    with manifest_path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists() and path.stat().st_size > 0
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
-    restore_owner(manifest_path)
+    restore_owner(path)
+
+
+def next_id(rows: list[dict[str, str]], key: str) -> int:
+    values = [int(row[key]) for row in rows if row.get(key, "").isdigit()]
+    return max(values, default=0) + 1
+
+
+def maps_dir(output_dir: Path) -> Path:
+    path = output_dir / "maps"
+    path.mkdir(parents=True, exist_ok=True)
+    restore_owner(path)
+    return path
+
+
+def normalize_class_id(value: str) -> int:
+    class_id = value.strip()
+    if not class_id.isdigit():
+        raise ValueError(f"class_id must be a number, got {value!r}.")
+    return int(class_id)
+
+
+def prompt_class_id() -> int | None:
+    while True:
+        value = input("\nClass ID (number, q to quit): ").strip()
+        if value.lower() in {"q", "quit", "exit"}:
+            return None
+        if value.isdigit():
+            return int(value)
+        print("Please enter a numeric class_id, or q to quit.")
 
 
 def build_output_path(
     output_dir: Path,
-    session_id: str,
-    class_slug: str,
-    sequence: int,
-    light: int,
-    view_index: int,
-    angle: int,
-    aperture: float,
-    iso: int,
-    shutter: str,
+    class_id: int,
+    sample_id: int,
+    light_id: int,
+    view_id: int,
+    param_id: int,
 ) -> Path:
-    file_name = (
-        f"{session_id}__{class_slug}__{sequence:04d}"
-        f"__light{light:04d}"
-        f"__view{view_index}_{angle:03d}deg"
-        f"__f{aperture_label(aperture)}"
-        f"__iso{iso}"
-        f"__sh{shutter_file_label(shutter)}.jpg"
+    return (
+        output_dir
+        / format_id("c", class_id)
+        / format_id("s", sample_id)
+        / format_id("l", light_id)
+        / format_id("v", view_id)
+        / f"{format_id('p', param_id)}.jpg"
     )
-    return output_dir / file_name
+
+
+def ensure_class_row(map_dir: Path, class_id: int) -> None:
+    path = map_dir / "classes.csv"
+    rows = read_csv_rows(path)
+    if any(int(row["class_id"]) == class_id for row in rows if row.get("class_id", "").isdigit()):
+        return
+    append_csv_row(
+        path,
+        CLASS_FIELDS,
+        {
+            "class_id": class_id,
+            "class_folder": format_id("c", class_id),
+            "created_at": timestamp(),
+        },
+    )
+
+
+def next_sample_id(map_dir: Path, class_id: int) -> int:
+    rows = read_csv_rows(map_dir / "samples.csv")
+    sample_ids = [
+        int(row["sample_id"])
+        for row in rows
+        if row.get("class_id") == str(class_id) and row.get("sample_id", "").isdigit()
+    ]
+    return max(sample_ids, default=0) + 1
+
+
+def append_sample_row(
+    map_dir: Path,
+    class_id: int,
+    sample_id: int,
+    session_id: str,
+    total_captures: int,
+) -> None:
+    append_csv_row(
+        map_dir / "samples.csv",
+        SAMPLE_FIELDS,
+        {
+            "class_id": class_id,
+            "sample_id": sample_id,
+            "class_folder": format_id("c", class_id),
+            "sample_folder": format_id("s", sample_id),
+            "session_id": session_id,
+            "created_at": timestamp(),
+            "total_captures": total_captures,
+        },
+    )
+
+
+def get_or_create_light_id(map_dir: Path, intensity: int, cct: int) -> int:
+    path = map_dir / "lights.csv"
+    rows = read_csv_rows(path)
+    for row in rows:
+        if row.get("intensity") == str(intensity) and row.get("cct") == str(cct):
+            return int(row["light_id"])
+
+    light_id = next_id(rows, "light_id")
+    append_csv_row(
+        path,
+        LIGHT_FIELDS,
+        {
+            "light_id": light_id,
+            "light_folder": format_id("l", light_id),
+            "intensity": intensity,
+            "light_percent": light_percent(intensity),
+            "cct": cct,
+        },
+    )
+    return light_id
+
+
+def get_or_create_view_id(map_dir: Path, view_index: int, angle_degrees: int) -> int:
+    path = map_dir / "views.csv"
+    rows = read_csv_rows(path)
+    for row in rows:
+        if (
+            row.get("view_index") == str(view_index)
+            and row.get("angle_degrees") == str(angle_degrees)
+        ):
+            return int(row["view_id"])
+
+    view_id = next_id(rows, "view_id")
+    append_csv_row(
+        path,
+        VIEW_FIELDS,
+        {
+            "view_id": view_id,
+            "view_folder": format_id("v", view_id),
+            "view_index": view_index,
+            "angle_degrees": angle_degrees,
+        },
+    )
+    return view_id
+
+
+def get_or_create_param_id(map_dir: Path, aperture: float, iso: int, shutter: str) -> int:
+    path = map_dir / "params.csv"
+    rows = read_csv_rows(path)
+    aperture_value = format_number(aperture)
+    for row in rows:
+        if (
+            row.get("aperture") == aperture_value
+            and row.get("iso") == str(iso)
+            and row.get("shutter_speed") == shutter
+        ):
+            return int(row["param_id"])
+
+    param_id = next_id(rows, "param_id")
+    append_csv_row(
+        path,
+        PARAM_FIELDS,
+        {
+            "param_id": param_id,
+            "param_file": f"{format_id('p', param_id)}.jpg",
+            "aperture": aperture_value,
+            "iso": iso,
+            "shutter_speed": shutter,
+        },
+    )
+    return param_id
+
+
+def build_light_plan(map_dir: Path, args: argparse.Namespace) -> list[dict[str, object]]:
+    return [
+        {
+            "light_id": get_or_create_light_id(map_dir, intensity, args.cct),
+            "intensity": intensity,
+        }
+        for intensity in args.light_intensities
+    ]
+
+
+def build_view_plan(map_dir: Path, args: argparse.Namespace) -> list[dict[str, object]]:
+    view_plan = []
+    for view_index in range(args.views):
+        angle = (view_index * args.view_step) % 360
+        view_plan.append(
+            {
+                "view_id": get_or_create_view_id(map_dir, view_index, angle),
+                "view_index": view_index,
+                "angle_degrees": angle,
+            }
+        )
+    return view_plan
+
+
+def build_param_plan(map_dir: Path, args: argparse.Namespace) -> list[dict[str, object]]:
+    param_plan = []
+    for aperture in args.apertures:
+        for iso in args.isos:
+            for shutter in args.shutters:
+                param_plan.append(
+                    {
+                        "param_id": get_or_create_param_id(map_dir, aperture, iso, shutter),
+                        "aperture": aperture,
+                        "iso": iso,
+                        "shutter_speed": shutter,
+                    }
+                )
+    return param_plan
 
 
 class DryLightController:
@@ -173,9 +407,8 @@ class AmaranLightController:
         self._last_request_id = 0
 
     async def __aenter__(self) -> "AmaranLightController":
-        import websockets
-
-        self.ws = await websockets.connect(self.ws_url)
+        """ Connect to Amaran Light """
+        await self._connect()
         self._ensure_ok(await self._send("get_protocol_versions"), "get_protocol_versions")
 
         devices = self._extract_devices(
@@ -188,6 +421,7 @@ class AmaranLightController:
         if not devices:
             raise RuntimeError("No Amaran light found.")
 
+        # By default, we use the first light
         light = devices[0]
         self.node_id = light["node_id"]
         print(f"Using light: {light.get('name')} ({self.node_id})")
@@ -204,8 +438,28 @@ class AmaranLightController:
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
-        if self.ws is not None:
-            await self.ws.close()
+        if self.node_id is not None and self.ws is not None:
+            try:
+                self._ensure_ok(
+                    await self._send(
+                        "set_intensity",
+                        node_id=self.node_id,
+                        args={"intensity": 0},
+                    ),
+                    "set_intensity",
+                )
+                self._ensure_ok(
+                    await self._send(
+                        "set_sleep",
+                        node_id=self.node_id,
+                        args={"sleep": True},
+                    ),
+                    "set_sleep",
+                )
+                print("Light turned off and put to sleep.")
+            except Exception as exc:
+                print(f"Warning: failed to turn off light cleanly: {exc}")
+        await self._close_ws()
 
     async def set_intensity(self, intensity: int) -> None:
         if self.node_id is None:
@@ -245,7 +499,38 @@ class AmaranLightController:
         self._last_request_id = request_id
         return request_id
 
+    async def _connect(self) -> None:
+        import websockets
+
+        await self._close_ws()
+        self.ws = await websockets.connect(self.ws_url)
+
+    async def _close_ws(self) -> None:
+        if self.ws is None:
+            return
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+        finally:
+            self.ws = None
+
     async def _send(
+        self,
+        action: str,
+        node_id: Optional[str] = None,
+        args: Optional[dict] = None,
+    ):
+        for attempt in range(2):
+            try:
+                return await self._send_once(action, node_id=node_id, args=args)
+            except Exception:
+                if attempt == 1:
+                    raise
+                print(f"Light websocket disconnected during {action}; reconnecting and retrying...")
+                await self._connect()
+
+    async def _send_once(
         self,
         action: str,
         node_id: Optional[str] = None,
@@ -352,10 +637,22 @@ class DryCameraController:
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         print("[dry-run] camera disconnected")
 
-    def capture(self, aperture: float, iso: int, shutter: str, output_path: Path, timeout: float) -> int:
+    def capture(
+        self,
+        aperture: float,
+        iso: int,
+        shutter: str,
+        output_path: Path,
+        timeout: float,
+        save_media: str = DEFAULT_SAVE_MEDIA,
+        print_timing: bool = False,
+    ) -> int:
         print(f"[dry-run] capture ISO {iso}, F{aperture:g}, {shutter} -> {output_path.name}")
+        start = time.monotonic()
         output_path.write_text("dry-run placeholder\n", encoding="utf-8")
         restore_owner(output_path)
+        if print_timing:
+            print(f"  timing camera_capture_store: {time.monotonic() - start:.4f}s")
         return output_path.stat().st_size
 
 
@@ -406,7 +703,16 @@ class SonyCameraController:
         if self._context is not None:
             self._context.__exit__(exc_type, exc_value, traceback)
 
-    def capture(self, aperture: float, iso: int, shutter: str, output_path: Path, timeout: float) -> int:
+    def capture(
+        self,
+        aperture: float,
+        iso: int,
+        shutter: str,
+        output_path: Path,
+        timeout: float,
+        save_media: str = DEFAULT_SAVE_MEDIA,
+        print_timing: bool = False,
+    ) -> int:
         if self.camera is None:
             raise RuntimeError("Camera is not connected.")
 
@@ -415,30 +721,48 @@ class SonyCameraController:
         shutter_code = self._shutter_code(shutter)
 
         if self._last_iso != iso_code:
+            start = time.monotonic()
             self.camera.set_iso(iso_code)
             self._wait_for_setting(self.DeviceProperty.ISO, iso_code, "ISO")
+            if print_timing:
+                print(f"  timing camera_iso: {time.monotonic() - start:.4f}s")
             self._last_iso = iso_code
+        elif print_timing:
+            print("  timing camera_iso: skipped")
 
         if self._last_aperture != aperture_code:
+            start = time.monotonic()
             self.camera.set_aperture(aperture_code)
             self._wait_for_setting(self.DeviceProperty.F_NUMBER, aperture_code, "aperture")
+            if print_timing:
+                print(f"  timing camera_aperture: {time.monotonic() - start:.4f}s")
             self._last_aperture = aperture_code
+        elif print_timing:
+            print("  timing camera_aperture: skipped")
 
         if self._last_shutter != shutter_code:
+            start = time.monotonic()
             self.camera.set_shutter_speed(shutter_code)
             self._wait_for_setting(
                 self.DeviceProperty.SHUTTER_SPEED,
                 shutter_code,
                 "shutter speed",
             )
+            if print_timing:
+                print(f"  timing camera_shutter: {time.monotonic() - start:.4f}s")
             self._last_shutter = shutter_code
+        elif print_timing:
+            print("  timing camera_shutter: skipped")
 
+        start = time.monotonic()
         image_data = self.camera.capture(
             output_path=output_path,
-            save_to_camera=self.SaveMedia.HOST_AND_CAMERA,
+            save_to_camera=self._save_media_value(save_media),
             timeout=timeout,
         )
         restore_owner(output_path)
+        if print_timing:
+            print(f"  timing camera_capture_store: {time.monotonic() - start:.4f}s")
         return len(image_data)
 
     def _reverse_table(self, table: dict[int, str]) -> dict[str, int]:
@@ -463,6 +787,15 @@ class SonyCameraController:
             raise ValueError(f"Shutter speed {value!r} is not supported by this camera.")
         return code
 
+    def _save_media_value(self, value: str):
+        if value == "host":
+            return self.SaveMedia.HOST
+        if value == "camera":
+            return self.SaveMedia.CAMERA
+        if value == "host-and-camera":
+            return self.SaveMedia.HOST_AND_CAMERA
+        raise ValueError(f"Unsupported save media: {value!r}")
+
     def _wait_for_setting(
         self,
         property_code: int,
@@ -484,10 +817,13 @@ class SonyCameraController:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified dataset capture controller.")
-    parser.add_argument("--class-name", help="Object/class name. Prompts when omitted.")
+    parser.add_argument(
+        "--class-id",
+        help="Numeric class id. When omitted, prompts repeatedly for continuous capture.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--light-intensities", type=parse_int_list, default=DEFAULT_LIGHT_INTENSITIES)
-    parser.add_argument("--cct", type=int, default=3200)
+    parser.add_argument("--cct", type=int, default=DEFAULT_CCT)
     parser.add_argument("--apertures", type=parse_float_list, default=DEFAULT_APERTURES)
     parser.add_argument("--isos", type=parse_int_list, default=DEFAULT_ISOS)
     parser.add_argument("--shutters", type=parse_shutter_list, default=DEFAULT_SHUTTERS)
@@ -496,6 +832,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view-step", type=int, default=90)
     parser.add_argument("--views", type=int, default=4)
     parser.add_argument("--capture-timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--start-delay-seconds",
+        type=float,
+        default=DEFAULT_START_DELAY_SECONDS,
+        help="Seconds to wait after each class_id is entered before capture starts.",
+    )
+    parser.add_argument(
+        "--save-media",
+        choices=["host", "host-and-camera"],
+        default=DEFAULT_SAVE_MEDIA,
+        help="Where to save captured images. Default host means computer only.",
+    )
+    # settle waiting time used after changing light and view
     parser.add_argument("--settle-seconds", type=float, default=1.0)
     parser.add_argument("--light-ws-url", default="ws://127.0.0.1:12345")
     parser.add_argument(
@@ -506,15 +855,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-light", action="store_true")
     parser.add_argument("--skip-turntable", action="store_true")
+    parser.add_argument(
+        "--print-timing",
+        action="store_true",
+        help="Print lightweight timing for light changes, turntable moves, camera settings, and capture/store.",
+    )
     return parser.parse_args()
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.class_id is not None:
+        args.class_id = normalize_class_id(args.class_id)
+    if not args.dry_run and not args.skip_turntable:
+        args.turntable_port = resolve_turntable_port(args.turntable_port)
     for intensity in args.light_intensities:
         if intensity < 0 or intensity > 1000:
             raise ValueError(f"Light intensity must be in [0, 1000], got {intensity}.")
     if args.views < 1:
         raise ValueError("--views must be at least 1.")
+    if args.start_delay_seconds < 0:
+        raise ValueError("--start-delay-seconds must be >= 0.")
+
+
+def resolve_turntable_port(port: str) -> str:
+    if Path(port).exists():
+        return port
+
+    usbmodem_ports = sorted(glob.glob("/dev/cu.usbmodem*"))
+    if len(usbmodem_ports) == 1:
+        detected_port = usbmodem_ports[0]
+        print(f"Turntable port {port} not found; using detected port {detected_port}")
+        return detected_port
+
+    available_ports = sorted(glob.glob("/dev/cu.*"))
+    available_text = "\n  ".join(available_ports) if available_ports else "(none)"
+    raise RuntimeError(
+        f"Turntable port {port} not found.\n"
+        f"Available serial ports:\n  {available_text}\n"
+        "Pass the correct one with --turntable-port /dev/cu.usbmodemXXXX, "
+        "or use --skip-turntable for a camera/light-only test."
+    )
 
 
 def make_light_controller(args: argparse.Namespace):
@@ -546,19 +926,24 @@ def make_camera_controller(args: argparse.Namespace):
 
 
 def write_session_config(
-    output_dir: Path,
+    sample_dir: Path,
     session_id: str,
-    class_name: str,
+    class_id: int,
+    sample_id: int,
     args: argparse.Namespace,
     total_captures: int,
 ) -> None:
-    config_path = output_dir / f"{session_id}__session.json"
+    config_path = sample_dir / "session.json"
     config = {
         "session_id": session_id,
-        "class_name": class_name,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "output_dir": str(output_dir),
+        "class_id": class_id,
+        "sample_id": sample_id,
+        "class_folder": format_id("c", class_id),
+        "sample_folder": format_id("s", sample_id),
+        "created_at": timestamp(),
+        "sample_dir": str(sample_dir),
         "total_captures": total_captures,
+        "start_delay_seconds": args.start_delay_seconds,
         "light_intensities": args.light_intensities,
         "cct": args.cct,
         "views": args.views,
@@ -566,56 +951,156 @@ def write_session_config(
         "apertures": args.apertures,
         "isos": args.isos,
         "shutters": args.shutters,
+        "save_media": args.save_media,
         "turntable_port": args.turntable_port,
         "turntable_speed": args.turntable_speed,
         "dry_run": args.dry_run,
         "skip_light": args.skip_light,
         "skip_turntable": args.skip_turntable,
+        "print_timing": args.print_timing,
     }
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
     restore_owner(config_path)
 
 
+async def capture_one_class_id(
+    args: argparse.Namespace,
+    class_id: int,
+    output_dir: Path,
+    map_dir: Path,
+    light_plan: list[dict[str, object]],
+    view_plan: list[dict[str, object]],
+    param_plan: list[dict[str, object]],
+    light,
+    turntable,
+    camera,
+) -> None:
+    session_id = make_session_id()
+    total_captures = len(light_plan) * len(view_plan) * len(param_plan)
+    ensure_class_row(map_dir, class_id)
+    sample_id = next_sample_id(map_dir, class_id)
+    sample_dir = output_dir / format_id("c", class_id) / format_id("s", sample_id)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    restore_owner(sample_dir)
+    write_session_config(sample_dir, session_id, class_id, sample_id, args, total_captures)
+    append_sample_row(map_dir, class_id, sample_id, session_id, total_captures)
+
+    print(f"\nClass ID: {class_id}")
+    print(f"Sample: {sample_id}")
+    print(f"Session: {session_id}")
+    print(f"Sample folder: {sample_dir}")
+    print(f"Image index: {map_dir / 'images.csv'}")
+    print(f"Total captures: {total_captures}")
+    print(
+        "Plan: "
+        f"{len(light_plan)} lighting x "
+        f"{len(view_plan)} views x "
+        f"{len(param_plan)} parameter"
+    )
+    if args.start_delay_seconds > 0:
+        print(f"Starting capture in {args.start_delay_seconds:g} seconds...")
+        time.sleep(args.start_delay_seconds)
+
+    sequence = 0
+    for light_item in light_plan:
+        light_id = int(light_item["light_id"])
+        light_value = int(light_item["intensity"])
+        start = time.monotonic()
+        await light.set_intensity(light_value)
+        if args.print_timing:
+            print(f"  timing light_change: {time.monotonic() - start:.4f}s")
+        if hasattr(turntable, "goto"):
+            start = time.monotonic()
+            turntable.goto(0)
+            if args.print_timing:
+                print(f"  timing turntable_goto_0: {time.monotonic() - start:.4f}s")
+
+        for view_item in view_plan:
+            view_id = int(view_item["view_id"])
+            view_index = int(view_item["view_index"])
+            angle = int(view_item["angle_degrees"])
+            if view_index > 0:
+                start = time.monotonic()
+                turntable.rotate(args.view_step)
+                if args.print_timing:
+                    print(f"  timing turntable_rotate_{args.view_step:g}: {time.monotonic() - start:.4f}s")
+
+            for param_item in param_plan:
+                param_id = int(param_item["param_id"])
+                aperture = float(param_item["aperture"])
+                iso = int(param_item["iso"])
+                shutter = str(param_item["shutter_speed"])
+                sequence += 1
+                output_path = build_output_path(
+                    output_dir=output_dir,
+                    class_id=class_id,
+                    sample_id=sample_id,
+                    light_id=light_id,
+                    view_id=view_id,
+                    param_id=param_id,
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                restore_owner(output_path.parent)
+                print(
+                    f"[{sequence}/{total_captures}] "
+                    f"class {class_id}, sample {sample_id}, "
+                    f"light {light_id} ({light_value}/1000), "
+                    f"view {view_id} ({angle} deg), param {param_id} "
+                    f"(F{aperture:g}, ISO {iso}, {shutter})"
+                )
+                size = camera.capture(
+                    aperture=aperture,
+                    iso=iso,
+                    shutter=shutter,
+                    output_path=output_path,
+                    timeout=args.capture_timeout,
+                    save_media=args.save_media,
+                    print_timing=args.print_timing,
+                )
+                append_csv_row(
+                    map_dir / "images.csv",
+                    IMAGE_FIELDS,
+                    {
+                        "session_id": session_id,
+                        "sequence": sequence,
+                        "class_id": class_id,
+                        "sample_id": sample_id,
+                        "light_id": light_id,
+                        "view_id": view_id,
+                        "param_id": param_id,
+                        "image_path": str(output_path.relative_to(output_dir)),
+                        "captured_at": timestamp(),
+                    },
+                )
+                print(f"Saved {output_path.relative_to(output_dir)} ({size:,} bytes)")
+
+        if args.views > 1:
+            start = time.monotonic()
+            turntable.rotate(args.view_step)
+            if args.print_timing:
+                print(f"  timing turntable_rotate_return: {time.monotonic() - start:.4f}s")
+
+    print(f"Class ID {class_id} capture complete.")
+
+
 async def run_capture(args: argparse.Namespace) -> None:
     validate_args(args)
-
-    class_name = args.class_name or input("Class name: ").strip()
-    if not class_name:
-        raise ValueError("Class name cannot be empty.")
-    class_slug = slugify(class_name)
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     restore_owner(output_dir)
 
-    session_id = time.strftime("%Y%m%d_%H%M%S")
-    manifest_path = output_dir / "manifest.csv"
-    total_captures = (
-        len(args.light_intensities)
-        * args.views
-        * len(args.apertures)
-        * len(args.isos)
-        * len(args.shutters)
-    )
-    write_session_config(output_dir, session_id, class_name, args, total_captures)
-
-    print(f"Class: {class_name}")
-    print(f"Output folder: {output_dir}")
-    print(f"Manifest: {manifest_path}")
-    print(f"Total captures: {total_captures}")
-    print(
-        "Plan: "
-        f"{len(args.light_intensities)} lighting x "
-        f"{args.views} views x "
-        f"{len(args.apertures)} aperture x "
-        f"{len(args.isos)} ISO x "
-        f"{len(args.shutters)} shutter"
-    )
-
-    sequence = 0
+    map_dir = maps_dir(output_dir)
+    light_plan = build_light_plan(map_dir, args)
+    view_plan = build_view_plan(map_dir, args)
+    param_plan = build_param_plan(map_dir, args)
     light_controller = make_light_controller(args)
     turntable_controller = make_turntable_controller(args)
     camera_controller = make_camera_controller(args)
+
+    print(f"Output folder: {output_dir}")
+    print(f"Maps folder: {map_dir}")
+    print("Connecting hardware once for continuous capture...")
 
     async with light_controller as light:
         with turntable_controller as turntable, camera_controller as camera:
@@ -624,67 +1109,31 @@ async def run_capture(args: argparse.Namespace) -> None:
             if hasattr(turntable, "set_speed"):
                 turntable.set_speed(args.turntable_speed)
 
-            for light_value in args.light_intensities:
-                await light.set_intensity(light_value)
-                if hasattr(turntable, "goto"):
-                    turntable.goto(0)
+            while True:
+                if args.class_id is not None:
+                    class_id = args.class_id
+                else:
+                    class_id = prompt_class_id()
+                    if class_id is None:
+                        break
 
-                for view_index in range(args.views):
-                    if view_index > 0:
-                        turntable.rotate(args.view_step)
-                    angle = (view_index * args.view_step) % 360
+                await capture_one_class_id(
+                    args=args,
+                    class_id=class_id,
+                    output_dir=output_dir,
+                    map_dir=map_dir,
+                    light_plan=light_plan,
+                    view_plan=view_plan,
+                    param_plan=param_plan,
+                    light=light,
+                    turntable=turntable,
+                    camera=camera,
+                )
 
-                    for aperture in args.apertures:
-                        for iso in args.isos:
-                            for shutter in args.shutters:
-                                sequence += 1
-                                output_path = build_output_path(
-                                    output_dir=output_dir,
-                                    session_id=session_id,
-                                    class_slug=class_slug,
-                                    sequence=sequence,
-                                    light=light_value,
-                                    view_index=view_index,
-                                    angle=angle,
-                                    aperture=aperture,
-                                    iso=iso,
-                                    shutter=shutter,
-                                )
-                                print(
-                                    f"[{sequence}/{total_captures}] "
-                                    f"light {light_value}/1000, view {view_index} "
-                                    f"({angle} deg), F{aperture:g}, ISO {iso}, {shutter}"
-                                )
-                                size = camera.capture(
-                                    aperture=aperture,
-                                    iso=iso,
-                                    shutter=shutter,
-                                    output_path=output_path,
-                                    timeout=args.capture_timeout,
-                                )
-                                append_manifest_row(
-                                    manifest_path,
-                                    {
-                                        "session_id": session_id,
-                                        "sequence": sequence,
-                                        "class_name": class_name,
-                                        "file_name": output_path.name,
-                                        "image_path": str(output_path),
-                                        "light_intensity": light_value,
-                                        "light_percent": light_percent(light_value),
-                                        "cct": args.cct,
-                                        "view_index": view_index,
-                                        "angle_degrees": angle,
-                                        "aperture": aperture,
-                                        "iso": iso,
-                                        "shutter_speed": shutter,
-                                        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                                    },
-                                )
-                                print(f"Saved {output_path.name} ({size:,} bytes)")
+                if args.class_id is not None:
+                    break
 
-                if args.views > 1:
-                    turntable.rotate(args.view_step)
+                input("\nChange object, then press Enter for the next class_id...")
 
     print("Capture session complete.")
 
