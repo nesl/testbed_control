@@ -1,0 +1,13 @@
+name: control
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - libusb
+  - websockets=15.0.1
+  - pip:
+      - cryptography==49.0.0
+      - libusb1==3.4.0
+      - pyserial==3.5
+      - git+https://github.com/olkham/pysonycam.git@3ef483cfd808aca4920547084ed9b9933aaaf98d
