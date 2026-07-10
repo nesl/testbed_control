@@ -48,10 +48,27 @@ def is_dog_index(index: int) -> bool:
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing required CSV: {path}")
-    with path.open("r", newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
+    if path.exists():
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+
+    jsonl_path = path.with_suffix(".jsonl")
+    if jsonl_path.exists():
+        rows: list[dict[str, str]] = []
+        with jsonl_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                rows.append(
+                    {
+                        key: "" if value is None else str(value)
+                        for key, value in payload.items()
+                    }
+                )
+        return rows
+
+    raise FileNotFoundError(f"Missing required CSV or JSONL: {path} / {jsonl_path}")
 
 
 def parse_models(value: str) -> list[str]:
@@ -88,7 +105,11 @@ def require_openclip_if_requested(models: list[str]) -> None:
         ) from exc
 
 
-def load_records(dataset_root: Path, allow_missing_images: bool) -> tuple[list[ImageRecord], int]:
+def load_records(
+    dataset_root: Path,
+    allow_missing_images: bool,
+    class_id_filter: str | None,
+) -> tuple[list[ImageRecord], int]:
     maps_dir = dataset_root / "maps"
     image_rows = read_csv_rows(maps_dir / "images.csv")
     light_rows = read_csv_rows(maps_dir / "lights.csv")
@@ -98,7 +119,13 @@ def load_records(dataset_root: Path, allow_missing_images: bool) -> tuple[list[I
     missing_count = 0
     missing_examples: list[Path] = []
 
-    for index, row in enumerate(image_rows):
+    selected_rows = [
+        row
+        for row in image_rows
+        if class_id_filter is None or row.get("class_id", "") == class_id_filter
+    ]
+
+    for index, row in enumerate(selected_rows):
         image_path_relative = row["image_path"]
         image_path = dataset_root / image_path_relative
         exists = image_path.exists()
@@ -439,6 +466,7 @@ def write_summary_json(
         "batch_size": args.batch_size,
         "openclip_model": args.openclip_model,
         "openclip_pretrained": args.openclip_pretrained,
+        "class_id_filter": args.class_id,
         "dog_index_start": DOG_INDEX_START,
         "dog_index_end": DOG_INDEX_END,
         "total_records": total_records,
@@ -454,8 +482,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Evaluate dog classification accuracy by lighting condition."
     )
     parser.add_argument("--dataset-root", type=Path, default=Path("dataset/test"))
-    parser.add_argument("--output-dir", type=Path, default=Path("reports/lighting_dog_accuracy"))
+    parser.add_argument("--output-dir", type=Path, default=Path("dataset/test/dog_diagnostics"))
     parser.add_argument("--models", type=parse_models, default=parse_models("resnet50,openclip"))
+    parser.add_argument(
+        "--class-id",
+        help="Optional class_id filter, useful when images.csv contains stale rows for other classes.",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--openclip-model", default="ViT-B-32")
@@ -473,7 +505,11 @@ def main() -> None:
 
     device = choose_device(args.device)
     require_openclip_if_requested(args.models)
-    records, missing_count = load_records(args.dataset_root, args.allow_missing_images)
+    records, missing_count = load_records(
+        args.dataset_root,
+        args.allow_missing_images,
+        args.class_id,
+    )
     valid_records = [record for record in records if record.exists]
     categories = ResNet50_Weights.IMAGENET1K_V2.meta["categories"]
 
