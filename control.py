@@ -9,7 +9,8 @@ Useful dry run for checking the capture plan and filenames::
     python control.py --dry-run
 
 Default plan:
-    lighting intensities: 10, 50
+    lighting position: front
+    lighting intensities: 0, 10, 50, 300, 500, 700, 1000
     views: 0, 90, 180, 270 degrees
     apertures: F3.2
     ISO: 800
@@ -21,7 +22,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import csv
 import glob
 import json
 import os
@@ -31,62 +31,17 @@ from pathlib import Path
 from typing import Optional
 
 
-DEFAULT_OUTPUT_DIR = Path("sony_camera/captures/dataset")
+DEFAULT_OUTPUT_DIR = Path("dataset")
 DEFAULT_TURNTABLE_PORT = "/dev/cu.usbmodem1101"
 DEFAULT_CCT = 5600
+DEFAULT_LIGHT_POSITION = "normal" # optional: normal, reflect, face, side
 DEFAULT_LIGHT_INTENSITIES = [0, 10, 50, 300, 500, 700, 1000]
-DEFAULT_APERTURES = [2.8, 4, 8, 13, 16, 22]
+DEFAULT_APERTURES = [2.8, 4, 8, 11, 16, 22]
 DEFAULT_ISOS = [100, 250, 800, 2000, 3200, 6400, 12800, 32000]
 DEFAULT_SHUTTERS = ['0.5"', "1/3", "1/15", "1/60", "1/250", "1/1000"]
 DEFAULT_SAVE_MEDIA = "host"
 DEFAULT_START_DELAY_SECONDS = 10.0
 PAD_WIDTH = 3
-
-CLASS_FIELDS = [
-    "class_id",
-    "class_folder",
-    "created_at",
-]
-SAMPLE_FIELDS = [
-    "class_id",
-    "sample_id",
-    "class_folder",
-    "sample_folder",
-    "session_id",
-    "created_at",
-    "total_captures",
-]
-LIGHT_FIELDS = [
-    "light_id",
-    "light_folder",
-    "intensity",
-    "light_percent",
-    "cct",
-]
-VIEW_FIELDS = [
-    "view_id",
-    "view_folder",
-    "view_index",
-    "angle_degrees",
-]
-PARAM_FIELDS = [
-    "param_id",
-    "param_file",
-    "aperture",
-    "iso",
-    "shutter_speed",
-]
-IMAGE_FIELDS = [
-    "session_id",
-    "sequence",
-    "class_id",
-    "sample_id",
-    "light_id",
-    "view_id",
-    "param_id",
-    "image_path",
-    "captured_at",
-]
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -150,27 +105,17 @@ def restore_owner(path: Path) -> None:
     os.chown(path, int(uid_text), int(gid_text))
 
 
-def read_csv_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists() or path.stat().st_size == 0:
-        return []
-    with path.open("r", newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
-
-
-def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, object]) -> None:
+def append_jsonl_record(path: Path, record: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = path.exists() and path.stat().st_size > 0
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
     restore_owner(path)
 
 
-def next_id(rows: list[dict[str, str]], key: str) -> int:
-    values = [int(row[key]) for row in rows if row.get(key, "").isdigit()]
-    return max(values, default=0) + 1
+def write_json_file(path: Path, data: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    restore_owner(path)
 
 
 def maps_dir(output_dir: Path) -> Path:
@@ -178,6 +123,16 @@ def maps_dir(output_dir: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     restore_owner(path)
     return path
+
+
+def ensure_output_dir_for_mode(output_dir: Path, capture_mode: str) -> None:
+    if capture_mode == "fresh" and output_dir.exists() and any(output_dir.iterdir()):
+        raise RuntimeError(
+            f"--capture-mode fresh requires an empty output directory, got {output_dir}. "
+            "Use a new --output-dir or clear it manually."
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    restore_owner(output_dir)
 
 
 def normalize_class_id(value: str) -> int:
@@ -215,42 +170,149 @@ def build_output_path(
     )
 
 
-def ensure_class_row(map_dir: Path, class_id: int) -> None:
-    path = map_dir / "classes.csv"
-    rows = read_csv_rows(path)
-    if any(int(row["class_id"]) == class_id for row in rows if row.get("class_id", "").isdigit()):
-        return
-    append_csv_row(
-        path,
-        CLASS_FIELDS,
+def build_capture_record(
+    *,
+    session_id: str,
+    sequence: int,
+    class_id: int,
+    sample_id: int,
+    light_id: int,
+    light_position: str,
+    light_intensity: int,
+    light_cct: int,
+    view_id: int,
+    angle_degrees: int,
+    param_id: int,
+    aperture: float,
+    iso: int,
+    shutter_speed: str,
+    output_dir: Path,
+    output_path: Path,
+    captured_at: str,
+    size_bytes: int,
+) -> dict[str, object]:
+    image_path = str(output_path.relative_to(output_dir))
+    return {
+        "session_id": session_id,
+        "sequence": sequence,
+        "class_id": class_id,
+        "sample_id": sample_id,
+        "light_id": light_id,
+        "view_id": view_id,
+        "param_id": param_id,
+        "position": light_position,
+        "intensity": light_intensity,
+        "cct": light_cct,
+        "angle_degrees": angle_degrees,
+        "aperture": aperture,
+        "iso": iso,
+        "shutter_speed": shutter_speed,
+        "image_path": image_path,
+        "captured_at": captured_at,
+        "size_bytes": size_bytes,
+    }
+
+
+def new_dataset_map() -> dict[str, object]:
+    now = timestamp()
+    return {
+        "schema_version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "classes": [],
+        "samples": [],
+        "lights": [],
+        "views": [],
+        "params": [],
+    }
+
+
+def load_dataset_map(path: Path) -> dict[str, object]:
+    if not path.exists() or path.stat().st_size == 0:
+        return new_dataset_map()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Dataset parameter map is not valid JSON: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Dataset parameter map must be a JSON object: {path}")
+    for key in ["classes", "samples", "lights", "views", "params"]:
+        if not isinstance(data.get(key), list):
+            data[key] = []
+    data.setdefault("schema_version", 1)
+    data.setdefault("created_at", timestamp())
+    data["updated_at"] = timestamp()
+    return data
+
+
+def save_dataset_map(map_dir: Path, dataset_map: dict[str, object]) -> None:
+    dataset_map["updated_at"] = timestamp()
+    write_json_file(map_dir / "parameters.json", dataset_map)
+
+
+def map_items(dataset_map: dict[str, object], key: str) -> list[dict[str, object]]:
+    items = dataset_map.setdefault(key, [])
+    if not isinstance(items, list):
+        raise ValueError(f"Dataset map field {key!r} must be a list.")
+    return items  # type: ignore[return-value]
+
+
+def next_map_id(items: list[dict[str, object]], key: str) -> int:
+    values = []
+    for item in items:
+        value = item.get(key)
+        if isinstance(value, int):
+            values.append(value)
+        elif isinstance(value, str) and value.isdigit():
+            values.append(int(value))
+    return max(values, default=0) + 1
+
+
+def ensure_class_entry(dataset_map: dict[str, object], class_id: int) -> None:
+    classes = map_items(dataset_map, "classes")
+    for item in classes:
+        if int(item.get("class_id", -1)) == class_id:
+            return
+    classes.append(
         {
             "class_id": class_id,
             "class_folder": format_id("c", class_id),
             "created_at": timestamp(),
-        },
+        }
     )
 
 
-def next_sample_id(map_dir: Path, class_id: int) -> int:
-    rows = read_csv_rows(map_dir / "samples.csv")
-    sample_ids = [
-        int(row["sample_id"])
-        for row in rows
-        if row.get("class_id") == str(class_id) and row.get("sample_id", "").isdigit()
+def sample_ids_from_dirs(output_dir: Path, class_id: int) -> list[int]:
+    class_dir = output_dir / format_id("c", class_id)
+    if not class_dir.exists():
+        return []
+    sample_ids = []
+    for path in class_dir.iterdir():
+        if path.is_dir() and path.name.startswith("s") and path.name[1:].isdigit():
+            sample_ids.append(int(path.name[1:]))
+    return sample_ids
+
+
+def next_sample_id(dataset_map: dict[str, object], output_dir: Path, class_id: int) -> int:
+    samples = map_items(dataset_map, "samples")
+    map_sample_ids = [
+        int(item["sample_id"])
+        for item in samples
+        if int(item.get("class_id", -1)) == class_id and str(item.get("sample_id", "")).isdigit()
     ]
-    return max(sample_ids, default=0) + 1
+    if map_sample_ids:
+        return max(map_sample_ids) + 1
+    return max(sample_ids_from_dirs(output_dir, class_id), default=0) + 1
 
 
-def append_sample_row(
-    map_dir: Path,
+def append_sample_entry(
+    dataset_map: dict[str, object],
     class_id: int,
     sample_id: int,
     session_id: str,
     total_captures: int,
 ) -> None:
-    append_csv_row(
-        map_dir / "samples.csv",
-        SAMPLE_FIELDS,
+    map_items(dataset_map, "samples").append(
         {
             "class_id": class_id,
             "sample_id": sample_id,
@@ -259,100 +321,131 @@ def append_sample_row(
             "session_id": session_id,
             "created_at": timestamp(),
             "total_captures": total_captures,
-        },
+        }
     )
 
 
-def get_or_create_light_id(map_dir: Path, intensity: int, cct: int) -> int:
-    path = map_dir / "lights.csv"
-    rows = read_csv_rows(path)
-    for row in rows:
-        if row.get("intensity") == str(intensity) and row.get("cct") == str(cct):
-            return int(row["light_id"])
+def validate_light_intensity(intensity: int) -> None:
+    if intensity < 0 or intensity > 1000:
+        raise ValueError(f"Light intensity must be in [0, 1000], got {intensity}.")
 
-    light_id = next_id(rows, "light_id")
-    append_csv_row(
-        path,
-        LIGHT_FIELDS,
+
+def get_or_create_light_id(
+    dataset_map: dict[str, object],
+    position: str,
+    intensity: int,
+    cct: int,
+) -> int:
+    lights = map_items(dataset_map, "lights")
+    for item in lights:
+        if (
+            item.get("position") == position
+            and int(item.get("intensity", -1)) == intensity
+            and int(item.get("cct", -1)) == cct
+        ):
+            return int(item["light_id"])
+
+    light_id = next_map_id(lights, "light_id")
+    lights.append(
         {
             "light_id": light_id,
             "light_folder": format_id("l", light_id),
+            "position": position,
             "intensity": intensity,
             "light_percent": light_percent(intensity),
             "cct": cct,
-        },
+        }
     )
     return light_id
 
 
-def get_or_create_view_id(map_dir: Path, view_index: int, angle_degrees: int) -> int:
-    path = map_dir / "views.csv"
-    rows = read_csv_rows(path)
-    for row in rows:
+def get_or_create_view_id(
+    dataset_map: dict[str, object],
+    view_index: int,
+    angle_degrees: int,
+) -> int:
+    views = map_items(dataset_map, "views")
+    for item in views:
         if (
-            row.get("view_index") == str(view_index)
-            and row.get("angle_degrees") == str(angle_degrees)
+            int(item.get("view_index", -1)) == view_index
+            and int(item.get("angle_degrees", -1)) == angle_degrees
         ):
-            return int(row["view_id"])
+            return int(item["view_id"])
 
-    view_id = next_id(rows, "view_id")
-    append_csv_row(
-        path,
-        VIEW_FIELDS,
+    view_id = next_map_id(views, "view_id")
+    views.append(
         {
             "view_id": view_id,
             "view_folder": format_id("v", view_id),
             "view_index": view_index,
             "angle_degrees": angle_degrees,
-        },
+        }
     )
     return view_id
 
 
-def get_or_create_param_id(map_dir: Path, aperture: float, iso: int, shutter: str) -> int:
-    path = map_dir / "params.csv"
-    rows = read_csv_rows(path)
+def get_or_create_param_id(
+    dataset_map: dict[str, object],
+    aperture: float,
+    iso: int,
+    shutter: str,
+) -> int:
+    params = map_items(dataset_map, "params")
     aperture_value = format_number(aperture)
-    for row in rows:
+    for item in params:
         if (
-            row.get("aperture") == aperture_value
-            and row.get("iso") == str(iso)
-            and row.get("shutter_speed") == shutter
+            str(item.get("aperture")) == aperture_value
+            and int(item.get("iso", -1)) == iso
+            and item.get("shutter_speed") == shutter
         ):
-            return int(row["param_id"])
+            return int(item["param_id"])
 
-    param_id = next_id(rows, "param_id")
-    append_csv_row(
-        path,
-        PARAM_FIELDS,
+    param_id = next_map_id(params, "param_id")
+    params.append(
         {
             "param_id": param_id,
             "param_file": f"{format_id('p', param_id)}.jpg",
             "aperture": aperture_value,
             "iso": iso,
             "shutter_speed": shutter,
-        },
+        }
     )
     return param_id
 
 
-def build_light_plan(map_dir: Path, args: argparse.Namespace) -> list[dict[str, object]]:
-    return [
+def build_lighting_plan(
+    dataset_map: dict[str, object],
+    args: argparse.Namespace,
+) -> list[dict[str, object]]:
+    plan = [
         {
-            "light_id": get_or_create_light_id(map_dir, intensity, args.cct),
+            "position": args.light_position,
             "intensity": intensity,
+            "cct": args.cct,
         }
         for intensity in args.light_intensities
     ]
 
+    for item in plan:
+        item["light_id"] = get_or_create_light_id(
+            dataset_map,
+            str(item["position"]),
+            int(item["intensity"]),
+            int(item["cct"]),
+        )
+    return plan
 
-def build_view_plan(map_dir: Path, args: argparse.Namespace) -> list[dict[str, object]]:
+
+def build_view_plan(
+    dataset_map: dict[str, object],
+    args: argparse.Namespace,
+) -> list[dict[str, object]]:
     view_plan = []
     for view_index in range(args.views):
         angle = (view_index * args.view_step) % 360
         view_plan.append(
             {
-                "view_id": get_or_create_view_id(map_dir, view_index, angle),
+                "view_id": get_or_create_view_id(dataset_map, view_index, angle),
                 "view_index": view_index,
                 "angle_degrees": angle,
             }
@@ -360,14 +453,22 @@ def build_view_plan(map_dir: Path, args: argparse.Namespace) -> list[dict[str, o
     return view_plan
 
 
-def build_param_plan(map_dir: Path, args: argparse.Namespace) -> list[dict[str, object]]:
+def build_param_plan(
+    dataset_map: dict[str, object],
+    args: argparse.Namespace,
+) -> list[dict[str, object]]:
     param_plan = []
     for aperture in args.apertures:
         for iso in args.isos:
             for shutter in args.shutters:
                 param_plan.append(
                     {
-                        "param_id": get_or_create_param_id(map_dir, aperture, iso, shutter),
+                        "param_id": get_or_create_param_id(
+                            dataset_map,
+                            aperture,
+                            iso,
+                            shutter,
+                        ),
                         "aperture": aperture,
                         "iso": iso,
                         "shutter_speed": shutter,
@@ -377,12 +478,21 @@ def build_param_plan(map_dir: Path, args: argparse.Namespace) -> list[dict[str, 
 
 
 class DryLightController:
+    def __init__(self):
+        self.current_cct = None
+
     async def __aenter__(self) -> "DryLightController":
         print("[dry-run] light connected")
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
         print("[dry-run] light disconnected")
+
+    async def set_cct(self, cct: int) -> None:
+        if self.current_cct == cct:
+            return
+        self.current_cct = cct
+        print(f"[dry-run] set light CCT {cct}K")
 
     async def set_intensity(self, intensity: int) -> None:
         print(f"[dry-run] set light intensity {intensity}/1000 ({light_percent(intensity):g}%)")
@@ -404,6 +514,7 @@ class AmaranLightController:
         self.settle_seconds = settle_seconds
         self.ws = None
         self.node_id = None
+        self.current_cct = None
         self._last_request_id = 0
 
     async def __aenter__(self) -> "AmaranLightController":
@@ -431,10 +542,7 @@ class AmaranLightController:
             "set_sleep",
         )
         await asyncio.sleep(self.settle_seconds)
-        self._ensure_ok(
-            await self._send("set_cct", node_id=self.node_id, args={"cct": self.cct}),
-            "set_cct",
-        )
+        await self.set_cct(self.cct)
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
@@ -460,6 +568,19 @@ class AmaranLightController:
             except Exception as exc:
                 print(f"Warning: failed to turn off light cleanly: {exc}")
         await self._close_ws()
+
+    async def set_cct(self, cct: int) -> None:
+        if self.node_id is None:
+            raise RuntimeError("Light is not connected.")
+        if self.current_cct == cct:
+            return
+        self._ensure_ok(
+            await self._send("set_cct", node_id=self.node_id, args={"cct": cct}),
+            "set_cct",
+        )
+        self.current_cct = cct
+        print(f"Light CCT: {cct}K")
+        await asyncio.sleep(self.settle_seconds)
 
     async def set_intensity(self, intensity: int) -> None:
         if self.node_id is None:
@@ -646,6 +767,7 @@ class DryCameraController:
         timeout: float,
         save_media: str = DEFAULT_SAVE_MEDIA,
         print_timing: bool = False,
+        fast_shutter: bool = False,
     ) -> int:
         print(f"[dry-run] capture ISO {iso}, F{aperture:g}, {shutter} -> {output_path.name}")
         start = time.monotonic()
@@ -676,12 +798,14 @@ class SonyCameraController:
             DeviceProperty,
             F_NUMBER_TABLE,
             ISO_TABLE,
+            SHOT_OBJECT_HANDLE,
             SHUTTER_SPEED_TABLE,
             SaveMedia,
         )
 
         self.ExposureMode = ExposureMode
         self.DeviceProperty = DeviceProperty
+        self.SHOT_OBJECT_HANDLE = SHOT_OBJECT_HANDLE
         self.SaveMedia = SaveMedia
         self.iso_table = ISO_TABLE
         self.aperture_table = F_NUMBER_TABLE
@@ -712,6 +836,7 @@ class SonyCameraController:
         timeout: float,
         save_media: str = DEFAULT_SAVE_MEDIA,
         print_timing: bool = False,
+        fast_shutter: bool = False,
     ) -> int:
         if self.camera is None:
             raise RuntimeError("Camera is not connected.")
@@ -754,15 +879,72 @@ class SonyCameraController:
         elif print_timing:
             print("  timing camera_shutter: skipped")
 
+        total_start = time.monotonic()
+        media = self._save_media_value(save_media)
+        host_receives = media in (self.SaveMedia.HOST, self.SaveMedia.HOST_AND_CAMERA)
+
         start = time.monotonic()
-        image_data = self.camera.capture(
-            output_path=output_path,
-            save_to_camera=self._save_media_value(save_media),
-            timeout=timeout,
-        )
+        self.camera.set_save_media(media)
+        self._wait_for_setting(self.DeviceProperty.SAVE_MEDIA, int(media), "save media")
+        if print_timing:
+            print(f"  timing camera_save_media: {time.monotonic() - start:.4f}s")
+
+        start = time.monotonic()
+        self.camera._wait_for_liveview()
+        if print_timing:
+            print(f"  timing camera_liveview_ready: {time.monotonic() - start:.4f}s")
+
+        start = time.monotonic()
+        self.camera._wait_for_shooting_file_info_clear(timeout=timeout)
+        if print_timing:
+            print(f"  timing camera_stale_clear: {time.monotonic() - start:.4f}s")
+
+        start = time.monotonic()
+        self.camera._fire_shutter(fast=fast_shutter)
+        if print_timing:
+            print(f"  timing camera_shutter_fire: {time.monotonic() - start:.4f}s")
+
+        if not host_receives:
+            if print_timing:
+                print("  timing camera_wait_image_ready: skipped")
+                print("  timing camera_get_object_info: skipped")
+                print("  timing camera_transfer: skipped")
+                print("  timing camera_disk_write: skipped")
+                print(f"  timing camera_capture_store: {time.monotonic() - total_start:.4f}s")
+            return 0
+
+        start = time.monotonic()
+        deadline = time.monotonic() + timeout
+        shooting_file_info = 0
+        while time.monotonic() < deadline:
+            info = self.camera.get_property(self.DeviceProperty.SHOOTING_FILE_INFO)
+            shooting_file_info = info.current_value if isinstance(info.current_value, int) else 0
+            if shooting_file_info & 0x8000:
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("Capture timed out waiting for image")
+        if print_timing:
+            print(f"  timing camera_wait_image_ready: {time.monotonic() - start:.4f}s")
+
+        start = time.monotonic()
+        self.camera.get_object_info(self.SHOT_OBJECT_HANDLE)
+        if print_timing:
+            print(f"  timing camera_get_object_info: {time.monotonic() - start:.4f}s")
+
+        start = time.monotonic()
+        image_data = self.camera.get_object(self.SHOT_OBJECT_HANDLE)
+        if print_timing:
+            print(f"  timing camera_transfer: {time.monotonic() - start:.4f}s")
+
+        start = time.monotonic()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(image_data)
+        if print_timing:
+            print(f"  timing camera_disk_write: {time.monotonic() - start:.4f}s")
         restore_owner(output_path)
         if print_timing:
-            print(f"  timing camera_capture_store: {time.monotonic() - start:.4f}s")
+            print(f"  timing camera_capture_store: {time.monotonic() - total_start:.4f}s")
         return len(image_data)
 
     def _reverse_table(self, table: dict[int, str]) -> dict[str, int]:
@@ -822,7 +1004,17 @@ def parse_args() -> argparse.Namespace:
         help="Numeric class id. When omitted, prompts repeatedly for continuous capture.",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--light-intensities", type=parse_int_list, default=DEFAULT_LIGHT_INTENSITIES)
+    parser.add_argument(
+        "--light-position",
+        default=DEFAULT_LIGHT_POSITION,
+        help="Current physical light position label used in filenames/maps.",
+    )
+    parser.add_argument(
+        "--light-intensities",
+        type=parse_int_list,
+        default=DEFAULT_LIGHT_INTENSITIES,
+        help="Comma-separated light intensities for the current light position.",
+    )
     parser.add_argument("--cct", type=int, default=DEFAULT_CCT)
     parser.add_argument("--apertures", type=parse_float_list, default=DEFAULT_APERTURES)
     parser.add_argument("--isos", type=parse_int_list, default=DEFAULT_ISOS)
@@ -844,6 +1036,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SAVE_MEDIA,
         help="Where to save captured images. Default host means computer only.",
     )
+    parser.add_argument(
+        "--capture-mode",
+        choices=["append", "fresh"],
+        default="append",
+        help="append reuses existing JSON maps; fresh requires an empty output directory.",
+    )
     # settle waiting time used after changing light and view
     parser.add_argument("--settle-seconds", type=float, default=1.0)
     parser.add_argument("--light-ws-url", default="ws://127.0.0.1:12345")
@@ -860,17 +1058,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print lightweight timing for light changes, turntable moves, camera settings, and capture/store.",
     )
+    parser.add_argument(
+        "--fast-shutter",
+        action="store_true",
+        help="Use pysonycam's fast shutter sequence to reduce S1/S2 trigger delay.",
+    )
     return parser.parse_args()
 
 
 def validate_args(args: argparse.Namespace) -> None:
     if args.class_id is not None:
         args.class_id = normalize_class_id(args.class_id)
+    args.light_position = args.light_position.strip()
+    if not args.light_position:
+        raise ValueError("--light-position cannot be empty.")
     if not args.dry_run and not args.skip_turntable:
         args.turntable_port = resolve_turntable_port(args.turntable_port)
     for intensity in args.light_intensities:
-        if intensity < 0 or intensity > 1000:
-            raise ValueError(f"Light intensity must be in [0, 1000], got {intensity}.")
+        validate_light_intensity(intensity)
     if args.views < 1:
         raise ValueError("--views must be at least 1.")
     if args.start_delay_seconds < 0:
@@ -925,50 +1130,13 @@ def make_camera_controller(args: argparse.Namespace):
     return SonyCameraController()
 
 
-def write_session_config(
-    sample_dir: Path,
-    session_id: str,
-    class_id: int,
-    sample_id: int,
-    args: argparse.Namespace,
-    total_captures: int,
-) -> None:
-    config_path = sample_dir / "session.json"
-    config = {
-        "session_id": session_id,
-        "class_id": class_id,
-        "sample_id": sample_id,
-        "class_folder": format_id("c", class_id),
-        "sample_folder": format_id("s", sample_id),
-        "created_at": timestamp(),
-        "sample_dir": str(sample_dir),
-        "total_captures": total_captures,
-        "start_delay_seconds": args.start_delay_seconds,
-        "light_intensities": args.light_intensities,
-        "cct": args.cct,
-        "views": args.views,
-        "view_step": args.view_step,
-        "apertures": args.apertures,
-        "isos": args.isos,
-        "shutters": args.shutters,
-        "save_media": args.save_media,
-        "turntable_port": args.turntable_port,
-        "turntable_speed": args.turntable_speed,
-        "dry_run": args.dry_run,
-        "skip_light": args.skip_light,
-        "skip_turntable": args.skip_turntable,
-        "print_timing": args.print_timing,
-    }
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-    restore_owner(config_path)
-
-
 async def capture_one_class_id(
     args: argparse.Namespace,
     class_id: int,
     output_dir: Path,
     map_dir: Path,
-    light_plan: list[dict[str, object]],
+    dataset_map: dict[str, object],
+    lighting_plan: list[dict[str, object]],
     view_plan: list[dict[str, object]],
     param_plan: list[dict[str, object]],
     light,
@@ -976,24 +1144,24 @@ async def capture_one_class_id(
     camera,
 ) -> None:
     session_id = make_session_id()
-    total_captures = len(light_plan) * len(view_plan) * len(param_plan)
-    ensure_class_row(map_dir, class_id)
-    sample_id = next_sample_id(map_dir, class_id)
+    total_captures = len(lighting_plan) * len(view_plan) * len(param_plan)
+    ensure_class_entry(dataset_map, class_id)
+    sample_id = next_sample_id(dataset_map, output_dir, class_id)
     sample_dir = output_dir / format_id("c", class_id) / format_id("s", sample_id)
     sample_dir.mkdir(parents=True, exist_ok=True)
     restore_owner(sample_dir)
-    write_session_config(sample_dir, session_id, class_id, sample_id, args, total_captures)
-    append_sample_row(map_dir, class_id, sample_id, session_id, total_captures)
+    append_sample_entry(dataset_map, class_id, sample_id, session_id, total_captures)
+    save_dataset_map(map_dir, dataset_map)
 
     print(f"\nClass ID: {class_id}")
     print(f"Sample: {sample_id}")
     print(f"Session: {session_id}")
     print(f"Sample folder: {sample_dir}")
-    print(f"Image index: {map_dir / 'images.csv'}")
+    print(f"Capture index: {map_dir / 'captures.jsonl'}")
     print(f"Total captures: {total_captures}")
     print(
         "Plan: "
-        f"{len(light_plan)} lighting x "
+        f"{len(lighting_plan)} lighting x "
         f"{len(view_plan)} views x "
         f"{len(param_plan)} parameter"
     )
@@ -1002,10 +1170,14 @@ async def capture_one_class_id(
         time.sleep(args.start_delay_seconds)
 
     sequence = 0
-    for light_item in light_plan:
+    for light_item in lighting_plan:
         light_id = int(light_item["light_id"])
+        light_position = str(light_item["position"])
         light_value = int(light_item["intensity"])
+        light_cct = int(light_item["cct"])
+
         start = time.monotonic()
+        await light.set_cct(light_cct)
         await light.set_intensity(light_value)
         if args.print_timing:
             print(f"  timing light_change: {time.monotonic() - start:.4f}s")
@@ -1044,7 +1216,7 @@ async def capture_one_class_id(
                 print(
                     f"[{sequence}/{total_captures}] "
                     f"class {class_id}, sample {sample_id}, "
-                    f"light {light_id} ({light_value}/1000), "
+                    f"light {light_id} ({light_position}, {light_value}/1000, {light_cct}K), "
                     f"view {view_id} ({angle} deg), param {param_id} "
                     f"(F{aperture:g}, ISO {iso}, {shutter})"
                 )
@@ -1056,22 +1228,30 @@ async def capture_one_class_id(
                     timeout=args.capture_timeout,
                     save_media=args.save_media,
                     print_timing=args.print_timing,
+                    fast_shutter=args.fast_shutter,
                 )
-                append_csv_row(
-                    map_dir / "images.csv",
-                    IMAGE_FIELDS,
-                    {
-                        "session_id": session_id,
-                        "sequence": sequence,
-                        "class_id": class_id,
-                        "sample_id": sample_id,
-                        "light_id": light_id,
-                        "view_id": view_id,
-                        "param_id": param_id,
-                        "image_path": str(output_path.relative_to(output_dir)),
-                        "captured_at": timestamp(),
-                    },
+                captured_at = timestamp()
+                capture_record = build_capture_record(
+                    session_id=session_id,
+                    sequence=sequence,
+                    class_id=class_id,
+                    sample_id=sample_id,
+                    light_id=light_id,
+                    light_position=light_position,
+                    light_intensity=light_value,
+                    light_cct=light_cct,
+                    view_id=view_id,
+                    angle_degrees=angle,
+                    param_id=param_id,
+                    aperture=aperture,
+                    iso=iso,
+                    shutter_speed=shutter,
+                    output_dir=output_dir,
+                    output_path=output_path,
+                    captured_at=captured_at,
+                    size_bytes=size,
                 )
+                append_jsonl_record(map_dir / "captures.jsonl", capture_record)
                 print(f"Saved {output_path.relative_to(output_dir)} ({size:,} bytes)")
 
         if args.views > 1:
@@ -1087,13 +1267,20 @@ async def run_capture(args: argparse.Namespace) -> None:
     validate_args(args)
 
     output_dir = args.output_dir.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    restore_owner(output_dir)
+    ensure_output_dir_for_mode(output_dir, args.capture_mode)
 
     map_dir = maps_dir(output_dir)
-    light_plan = build_light_plan(map_dir, args)
-    view_plan = build_view_plan(map_dir, args)
-    param_plan = build_param_plan(map_dir, args)
+    if args.capture_mode == "fresh":
+        dataset_map = new_dataset_map()
+        (map_dir / "captures.jsonl").write_text("", encoding="utf-8")
+        restore_owner(map_dir / "captures.jsonl")
+    else:
+        dataset_map = load_dataset_map(map_dir / "parameters.json")
+
+    lighting_plan = build_lighting_plan(dataset_map, args)
+    view_plan = build_view_plan(dataset_map, args)
+    param_plan = build_param_plan(dataset_map, args)
+    save_dataset_map(map_dir, dataset_map)
     light_controller = make_light_controller(args)
     turntable_controller = make_turntable_controller(args)
     camera_controller = make_camera_controller(args)
@@ -1122,7 +1309,8 @@ async def run_capture(args: argparse.Namespace) -> None:
                     class_id=class_id,
                     output_dir=output_dir,
                     map_dir=map_dir,
-                    light_plan=light_plan,
+                    dataset_map=dataset_map,
+                    lighting_plan=lighting_plan,
                     view_plan=view_plan,
                     param_plan=param_plan,
                     light=light,
