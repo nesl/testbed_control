@@ -13,6 +13,9 @@
 #
 # Mapping layout:
 #   <output-dir>/maps/parameters.json  cumulative global parameter map
+#     samples[] includes per-object timing: started_at, completed_at,
+#     object_elapsed_seconds, capture_elapsed_seconds
+#     params[] includes p000 for auto exposure when enabled
 #   <output-dir>/maps/captures.jsonl   cumulative per-image records
 
 echo "This is a command cookbook. Copy a commented command from this file and run it manually."
@@ -24,17 +27,11 @@ exit 0
 # Command During Test
 # =========================
 
-“”“
-For all the test command, we will
-sweep all the camera parameters, skip turntable
-1. reflect light, only one light intensity in this test
-”“”
-# sonycam control.py --capture-mode fresh --output-dir dataset --light-position reflect --light-intensities 10 --fast-shutter --skip-turntable --views 1
+# Reflect light, single view, iterative class input, intensity 10, p000 auto exposure.
+# Prints per-object timing at the end of each sample.
+# sonycam control.py --capture-mode append --output-dir dataset --light-position reflect --light-intensities 10 --fast-shutter --skip-turntable --views 1
 
-"""
-2. face light (meant to be very bright)
-has to specity light intensity different from normal light
-"""
+# Face light can use a different intensity from normal/reflect light.
 # Append another physical light position to an existing dataset. Prompts for class_id repeatedly.
 # sonycam control.py --capture-mode append --output-dir dataset --light-position side --fast-shutter
 
@@ -44,6 +41,13 @@ has to specity light intensity different from normal light
 # Camera + light only for the current light position, skipping turntable.
 # sonycam control.py --capture-mode append --class-id 1 --output-dir dataset --light-position front --fast-shutter --skip-turntable
 
+
+# delete records
+# check only 
+# python capture_util/remove_records.py --output-dir dataset --class-id 1 --sample-id 3
+
+#apply
+# sudo 
 
 # =========================
 # Help / Sanity Checks
@@ -63,6 +67,32 @@ has to specity light intensity different from normal light
 
 # Print the first few per-image JSONL records.
 # python -c 'from itertools import islice; from pathlib import Path; print("".join(islice(Path("dataset/maps/captures.jsonl").open(), 5)), end="")'
+
+
+# =========================
+# Dataset Cleanup
+# =========================
+
+# Preview removing one bad sample and its map records.
+# python capture_util/remove_records.py --output-dir dataset --class-id 1 --sample-id 2
+
+# Actually remove one bad sample and its map records.
+# python capture_util/remove_records.py --output-dir dataset --class-id 1 --sample-id 2 --apply
+
+# Remove an entire class.
+# python capture_util/remove_records.py --output-dir dataset --class-id 2 --apply
+
+# Remove one light id across the dataset.
+# python capture_util/remove_records.py --output-dir dataset --light-id 1 --apply
+
+# Remove one physical lighting condition across the dataset.
+# python capture_util/remove_records.py --output-dir dataset --light-position reflect --intensity 10 --cct 5600 --apply
+
+# Remove one view id across the dataset.
+# python capture_util/remove_records.py --output-dir dataset --view-id 1 --apply
+
+# Remove only p000 auto exposure images/records.
+# python capture_util/remove_records.py --output-dir dataset --param-id 0 --apply
 
 
 # =========================
@@ -100,6 +130,9 @@ has to specity light intensity different from normal light
 # One view only, with the full camera parameter sweep.
 # sonycam control.py --capture-mode append --class-id 1 --output-dir dataset --light-position front --views 1 --fast-shutter
 
+# One view only, with no p000 auto-exposure image.
+# sonycam control.py --capture-mode append --class-id 1 --output-dir dataset --light-position front --views 1 --skip-auto-exposure --fast-shutter
+
 # Four views, one camera parameter.
 # sonycam control.py --capture-mode append --class-id 1 --output-dir dataset --light-position front --views 4 --view-step 90 --apertures 2.8 --isos 100 --shutters 60 --fast-shutter
 
@@ -114,23 +147,20 @@ has to specity light intensity different from normal light
 
 
 # =========================
-# Latency / Timing Tests
+# Per-object Timing Checks
 # =========================
 
-# Timing format dry-run: no real hardware.
-# python control.py --dry-run --print-timing --capture-mode append --class-id 1 --output-dir /private/tmp/testbed-latency-dry-run --light-position front --light-intensities 100 --views 1 --apertures 2.8 --isos 100 --shutters 60 --start-delay-seconds 0 --skip-turntable
+# Minimal dry-run timing check: writes samples[].object_elapsed_seconds in parameters.json.
+# python control.py --dry-run --capture-mode fresh --class-id 1 --output-dir /private/tmp/testbed-object-timing-dry-run --light-position front --light-intensities 100 --views 1 --apertures 2.8 --isos 100 --shutters 60 --start-delay-seconds 0 --skip-turntable
 
-# Minimal real hardware timing test with normal shutter trigger.
-# sonycam control.py --print-timing --capture-mode append --class-id 1 --output-dir /private/tmp/testbed-latency-hardware --light-position front --light-intensities 100 --views 1 --apertures 2.8 --isos 100 --shutters 60 --start-delay-seconds 0 --settle-seconds 0.2
-
-# Minimal real hardware timing test with fast shutter trigger.
-# sonycam control.py --print-timing --fast-shutter --capture-mode append --class-id 1 --output-dir /private/tmp/testbed-latency-fast-shutter --light-position front --light-intensities 100 --views 1 --apertures 2.8 --isos 100 --shutters 60 --start-delay-seconds 0 --settle-seconds 0.2
+# Minimal real hardware timing check with p000 auto exposure and one manual parameter.
+# sonycam control.py --capture-mode append --class-id 1 --output-dir /private/tmp/testbed-object-timing-hardware --light-position front --light-intensities 100 --views 1 --apertures 2.8 --isos 100 --shutters 60 --start-delay-seconds 0 --settle-seconds 0.2 --fast-shutter
 
 # Real light + camera timing, skip turntable.
-# sonycam control.py --print-timing --capture-mode append --class-id 1 --output-dir /private/tmp/testbed-latency-light-camera --light-position front --light-intensities 0,100,500 --views 1 --apertures 2.8 --isos 100 --shutters 60 --start-delay-seconds 0 --settle-seconds 0.2 --skip-turntable
+# sonycam control.py --capture-mode append --class-id 1 --output-dir /private/tmp/testbed-object-timing-light-camera --light-position front --light-intensities 0,100,500 --views 1 --apertures 2.8 --isos 100 --shutters 60 --start-delay-seconds 0 --settle-seconds 0.2 --skip-turntable --fast-shutter
 
 # Real camera timing only, skip light and turntable.
-# sonycam control.py --print-timing --capture-mode append --class-id 1 --output-dir /private/tmp/testbed-latency-camera-only --light-position front --light-intensities 0 --views 1 --apertures 2.8 --isos 100,800 --shutters 60 --start-delay-seconds 0 --skip-light --skip-turntable
+# sonycam control.py --capture-mode append --class-id 1 --output-dir /private/tmp/testbed-object-timing-camera-only --light-position front --light-intensities 0 --views 1 --apertures 2.8 --isos 100,800 --shutters 60 --start-delay-seconds 0 --skip-light --skip-turntable --fast-shutter
 
 
 # =========================

@@ -42,6 +42,7 @@ DEFAULT_SHUTTERS = ['0.5"', "1/3", "1/15", "1/60", "1/250", "1/1000"]
 DEFAULT_SAVE_MEDIA = "host"
 DEFAULT_START_DELAY_SECONDS = 10.0
 PAD_WIDTH = 3
+AUTO_PARAM_ID = 0
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -94,6 +95,11 @@ def format_number(value: float | int | str) -> str:
     if isinstance(value, float):
         return f"{value:g}"
     return str(value)
+
+
+def format_duration(seconds: float) -> str:
+    minutes, remaining_seconds = divmod(max(0.0, seconds), 60.0)
+    return f"{int(minutes)}m {remaining_seconds:.1f}s"
 
 
 def restore_owner(path: Path) -> None:
@@ -183,9 +189,10 @@ def build_capture_record(
     view_id: int,
     angle_degrees: int,
     param_id: int,
-    aperture: float,
-    iso: int,
+    aperture: float | str,
+    iso: int | str,
     shutter_speed: str,
+    exposure_mode: str,
     output_dir: Path,
     output_path: Path,
     captured_at: str,
@@ -207,6 +214,7 @@ def build_capture_record(
         "aperture": aperture,
         "iso": iso,
         "shutter_speed": shutter_speed,
+        "exposure_mode": exposure_mode,
         "image_path": image_path,
         "captured_at": captured_at,
         "size_bytes": size_bytes,
@@ -311,6 +319,7 @@ def append_sample_entry(
     sample_id: int,
     session_id: str,
     total_captures: int,
+    started_at: str,
 ) -> None:
     map_items(dataset_map, "samples").append(
         {
@@ -319,9 +328,40 @@ def append_sample_entry(
             "class_folder": format_id("c", class_id),
             "sample_folder": format_id("s", sample_id),
             "session_id": session_id,
-            "created_at": timestamp(),
+            "created_at": started_at,
+            "started_at": started_at,
             "total_captures": total_captures,
         }
+    )
+
+
+def update_sample_timing(
+    dataset_map: dict[str, object],
+    class_id: int,
+    sample_id: int,
+    session_id: str,
+    capture_started_at: str,
+    completed_at: str,
+    object_elapsed_seconds: float,
+    capture_elapsed_seconds: float,
+) -> None:
+    for item in map_items(dataset_map, "samples"):
+        if (
+            int(item.get("class_id", -1)) == class_id
+            and int(item.get("sample_id", -1)) == sample_id
+            and item.get("session_id") == session_id
+        ):
+            item.update(
+                {
+                    "capture_started_at": capture_started_at,
+                    "completed_at": completed_at,
+                    "object_elapsed_seconds": round(object_elapsed_seconds, 3),
+                    "capture_elapsed_seconds": round(capture_elapsed_seconds, 3),
+                }
+            )
+            return
+    raise RuntimeError(
+        f"Could not update timing for class {class_id}, sample {sample_id}, session {session_id}."
     )
 
 
@@ -393,9 +433,13 @@ def get_or_create_param_id(
     params = map_items(dataset_map, "params")
     aperture_value = format_number(aperture)
     for item in params:
+        try:
+            item_iso = int(item.get("iso", -1))
+        except (TypeError, ValueError):
+            continue
         if (
             str(item.get("aperture")) == aperture_value
-            and int(item.get("iso", -1)) == iso
+            and item_iso == iso
             and item.get("shutter_speed") == shutter
         ):
             return int(item["param_id"])
@@ -411,6 +455,23 @@ def get_or_create_param_id(
         }
     )
     return param_id
+
+
+def ensure_auto_param_entry(dataset_map: dict[str, object]) -> None:
+    params = map_items(dataset_map, "params")
+    for item in params:
+        if int(item.get("param_id", -1)) == AUTO_PARAM_ID:
+            return
+    params.append(
+        {
+            "param_id": AUTO_PARAM_ID,
+            "param_file": f"{format_id('p', AUTO_PARAM_ID)}.jpg",
+            "aperture": "auto",
+            "iso": "auto",
+            "shutter_speed": "auto",
+            "exposure_mode": "auto",
+        }
+    )
 
 
 def build_lighting_plan(
@@ -766,15 +827,23 @@ class DryCameraController:
         output_path: Path,
         timeout: float,
         save_media: str = DEFAULT_SAVE_MEDIA,
-        print_timing: bool = False,
         fast_shutter: bool = False,
     ) -> int:
         print(f"[dry-run] capture ISO {iso}, F{aperture:g}, {shutter} -> {output_path.name}")
-        start = time.monotonic()
         output_path.write_text("dry-run placeholder\n", encoding="utf-8")
         restore_owner(output_path)
-        if print_timing:
-            print(f"  timing camera_capture_store: {time.monotonic() - start:.4f}s")
+        return output_path.stat().st_size
+
+    def capture_auto(
+        self,
+        output_path: Path,
+        timeout: float,
+        save_media: str = DEFAULT_SAVE_MEDIA,
+        fast_shutter: bool = False,
+    ) -> int:
+        print(f"[dry-run] capture auto exposure -> {output_path.name}")
+        output_path.write_text("dry-run auto exposure placeholder\n", encoding="utf-8")
+        restore_owner(output_path)
         return output_path.stat().st_size
 
 
@@ -788,6 +857,7 @@ class SonyCameraController:
         self.iso_table = None
         self.aperture_table = None
         self.shutter_table = None
+        self._last_exposure_mode = None
         self._last_iso = None
         self._last_aperture = None
         self._last_shutter = None
@@ -815,12 +885,7 @@ class SonyCameraController:
         self.camera = self._context.__enter__()
         self.camera.authenticate()
         self.camera.set_mode("still")
-        self.camera.set_exposure_mode(ExposureMode.MANUAL)
-        self._wait_for_setting(
-            DeviceProperty.EXPOSURE_MODE,
-            int(ExposureMode.MANUAL),
-            "manual exposure mode",
-        )
+        self._set_exposure_mode(ExposureMode.MANUAL, "manual exposure mode")
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -835,7 +900,6 @@ class SonyCameraController:
         output_path: Path,
         timeout: float,
         save_media: str = DEFAULT_SAVE_MEDIA,
-        print_timing: bool = False,
         fast_shutter: bool = False,
     ) -> int:
         if self.camera is None:
@@ -844,76 +908,65 @@ class SonyCameraController:
         iso_code = self._iso_code(iso)
         aperture_code = self._aperture_code(aperture)
         shutter_code = self._shutter_code(shutter)
+        changed_to_manual = self._set_exposure_mode(
+            self.ExposureMode.MANUAL,
+            "manual exposure mode",
+        )
 
         if self._last_iso != iso_code:
-            start = time.monotonic()
             self.camera.set_iso(iso_code)
             self._wait_for_setting(self.DeviceProperty.ISO, iso_code, "ISO")
-            if print_timing:
-                print(f"  timing camera_iso: {time.monotonic() - start:.4f}s")
             self._last_iso = iso_code
-        elif print_timing:
-            print("  timing camera_iso: skipped")
 
         if self._last_aperture != aperture_code:
-            start = time.monotonic()
             self.camera.set_aperture(aperture_code)
             self._wait_for_setting(self.DeviceProperty.F_NUMBER, aperture_code, "aperture")
-            if print_timing:
-                print(f"  timing camera_aperture: {time.monotonic() - start:.4f}s")
             self._last_aperture = aperture_code
-        elif print_timing:
-            print("  timing camera_aperture: skipped")
 
         if self._last_shutter != shutter_code:
-            start = time.monotonic()
             self.camera.set_shutter_speed(shutter_code)
             self._wait_for_setting(
                 self.DeviceProperty.SHUTTER_SPEED,
                 shutter_code,
                 "shutter speed",
             )
-            if print_timing:
-                print(f"  timing camera_shutter: {time.monotonic() - start:.4f}s")
             self._last_shutter = shutter_code
-        elif print_timing:
-            print("  timing camera_shutter: skipped")
+        capture_fast = fast_shutter and not changed_to_manual
+        if fast_shutter and changed_to_manual:
+            print("Using normal shutter for first manual capture after auto exposure; fast shutter resumes after this.")
+        return self._capture_to_path(output_path, timeout, save_media, capture_fast)
 
-        total_start = time.monotonic()
+    def capture_auto(
+        self,
+        output_path: Path,
+        timeout: float,
+        save_media: str = DEFAULT_SAVE_MEDIA,
+        fast_shutter: bool = False,
+    ) -> int:
+        if self.camera is None:
+            raise RuntimeError("Camera is not connected.")
+        self._set_exposure_mode(self._auto_exposure_mode(), "auto exposure mode")
+        return self._capture_to_path(output_path, timeout, save_media, fast_shutter=False)
+
+    def _capture_to_path(
+        self,
+        output_path: Path,
+        timeout: float,
+        save_media: str,
+        fast_shutter: bool,
+    ) -> int:
         media = self._save_media_value(save_media)
         host_receives = media in (self.SaveMedia.HOST, self.SaveMedia.HOST_AND_CAMERA)
 
-        start = time.monotonic()
         self.camera.set_save_media(media)
         self._wait_for_setting(self.DeviceProperty.SAVE_MEDIA, int(media), "save media")
-        if print_timing:
-            print(f"  timing camera_save_media: {time.monotonic() - start:.4f}s")
-
-        start = time.monotonic()
         self.camera._wait_for_liveview()
-        if print_timing:
-            print(f"  timing camera_liveview_ready: {time.monotonic() - start:.4f}s")
-
-        start = time.monotonic()
         self.camera._wait_for_shooting_file_info_clear(timeout=timeout)
-        if print_timing:
-            print(f"  timing camera_stale_clear: {time.monotonic() - start:.4f}s")
-
-        start = time.monotonic()
         self.camera._fire_shutter(fast=fast_shutter)
-        if print_timing:
-            print(f"  timing camera_shutter_fire: {time.monotonic() - start:.4f}s")
 
         if not host_receives:
-            if print_timing:
-                print("  timing camera_wait_image_ready: skipped")
-                print("  timing camera_get_object_info: skipped")
-                print("  timing camera_transfer: skipped")
-                print("  timing camera_disk_write: skipped")
-                print(f"  timing camera_capture_store: {time.monotonic() - total_start:.4f}s")
             return 0
 
-        start = time.monotonic()
         deadline = time.monotonic() + timeout
         shooting_file_info = 0
         while time.monotonic() < deadline:
@@ -924,28 +977,39 @@ class SonyCameraController:
             time.sleep(0.2)
         else:
             raise RuntimeError("Capture timed out waiting for image")
-        if print_timing:
-            print(f"  timing camera_wait_image_ready: {time.monotonic() - start:.4f}s")
 
-        start = time.monotonic()
         self.camera.get_object_info(self.SHOT_OBJECT_HANDLE)
-        if print_timing:
-            print(f"  timing camera_get_object_info: {time.monotonic() - start:.4f}s")
-
-        start = time.monotonic()
         image_data = self.camera.get_object(self.SHOT_OBJECT_HANDLE)
-        if print_timing:
-            print(f"  timing camera_transfer: {time.monotonic() - start:.4f}s")
 
-        start = time.monotonic()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(image_data)
-        if print_timing:
-            print(f"  timing camera_disk_write: {time.monotonic() - start:.4f}s")
         restore_owner(output_path)
-        if print_timing:
-            print(f"  timing camera_capture_store: {time.monotonic() - total_start:.4f}s")
         return len(image_data)
+
+    def _set_exposure_mode(self, mode, label: str) -> bool:
+        mode_value = int(mode)
+        if self._last_exposure_mode == mode_value:
+            return False
+        self.camera.set_exposure_mode(mode)
+        self._wait_for_setting(self.DeviceProperty.EXPOSURE_MODE, mode_value, label)
+        self._last_exposure_mode = mode_value
+        self._last_iso = None
+        self._last_aperture = None
+        self._last_shutter = None
+        return True
+
+    def _auto_exposure_mode(self):
+        for name in ("PROGRAM_AUTO", "PROGRAM", "AUTO", "P", "INTELLIGENT_AUTO"):
+            mode = getattr(self.ExposureMode, name, None)
+            if mode is not None:
+                return mode
+        available = ", ".join(
+            name for name in getattr(self.ExposureMode, "__members__", {}) if name != "MANUAL"
+        )
+        raise RuntimeError(
+            "Could not find a supported auto exposure mode in pysonycam ExposureMode. "
+            f"Available modes: {available or 'unknown'}."
+        )
 
     def _reverse_table(self, table: dict[int, str]) -> dict[str, int]:
         return {label.upper(): code for code, label in table.items()}
@@ -1054,9 +1118,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-light", action="store_true")
     parser.add_argument("--skip-turntable", action="store_true")
     parser.add_argument(
-        "--print-timing",
+        "--skip-auto-exposure",
         action="store_true",
-        help="Print lightweight timing for light changes, turntable moves, camera settings, and capture/store.",
+        help="Do not capture the p000 auto-exposure image before each manual parameter sweep.",
     )
     parser.add_argument(
         "--fast-shutter",
@@ -1143,14 +1207,25 @@ async def capture_one_class_id(
     turntable,
     camera,
 ) -> None:
+    object_start_monotonic = time.monotonic()
+    object_started_at = timestamp()
     session_id = make_session_id()
-    total_captures = len(lighting_plan) * len(view_plan) * len(param_plan)
+    auto_exposure_enabled = not args.skip_auto_exposure
+    params_per_view = len(param_plan) + (1 if auto_exposure_enabled else 0)
+    total_captures = len(lighting_plan) * len(view_plan) * params_per_view
     ensure_class_entry(dataset_map, class_id)
     sample_id = next_sample_id(dataset_map, output_dir, class_id)
     sample_dir = output_dir / format_id("c", class_id) / format_id("s", sample_id)
     sample_dir.mkdir(parents=True, exist_ok=True)
     restore_owner(sample_dir)
-    append_sample_entry(dataset_map, class_id, sample_id, session_id, total_captures)
+    append_sample_entry(
+        dataset_map,
+        class_id,
+        sample_id,
+        session_id,
+        total_captures,
+        object_started_at,
+    )
     save_dataset_map(map_dir, dataset_map)
 
     print(f"\nClass ID: {class_id}")
@@ -1163,12 +1238,15 @@ async def capture_one_class_id(
         "Plan: "
         f"{len(lighting_plan)} lighting x "
         f"{len(view_plan)} views x "
-        f"{len(param_plan)} parameter"
+        f"{len(param_plan)} manual parameter"
+        f"{' + auto exposure' if auto_exposure_enabled else ''}"
     )
     if args.start_delay_seconds > 0:
         print(f"Starting capture in {args.start_delay_seconds:g} seconds...")
         time.sleep(args.start_delay_seconds)
 
+    capture_start_monotonic = time.monotonic()
+    capture_started_at = timestamp()
     sequence = 0
     for light_item in lighting_plan:
         light_id = int(light_item["light_id"])
@@ -1176,26 +1254,67 @@ async def capture_one_class_id(
         light_value = int(light_item["intensity"])
         light_cct = int(light_item["cct"])
 
-        start = time.monotonic()
         await light.set_cct(light_cct)
         await light.set_intensity(light_value)
-        if args.print_timing:
-            print(f"  timing light_change: {time.monotonic() - start:.4f}s")
         if hasattr(turntable, "goto"):
-            start = time.monotonic()
             turntable.goto(0)
-            if args.print_timing:
-                print(f"  timing turntable_goto_0: {time.monotonic() - start:.4f}s")
 
         for view_item in view_plan:
             view_id = int(view_item["view_id"])
             view_index = int(view_item["view_index"])
             angle = int(view_item["angle_degrees"])
             if view_index > 0:
-                start = time.monotonic()
                 turntable.rotate(args.view_step)
-                if args.print_timing:
-                    print(f"  timing turntable_rotate_{args.view_step:g}: {time.monotonic() - start:.4f}s")
+
+            if auto_exposure_enabled:
+                sequence += 1
+                output_path = build_output_path(
+                    output_dir=output_dir,
+                    class_id=class_id,
+                    sample_id=sample_id,
+                    light_id=light_id,
+                    view_id=view_id,
+                    param_id=AUTO_PARAM_ID,
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                restore_owner(output_path.parent)
+                print(
+                    f"[{sequence}/{total_captures}] "
+                    f"class {class_id}, sample {sample_id}, "
+                    f"light {light_id} ({light_position}, {light_value}/1000, {light_cct}K), "
+                    f"view {view_id} ({angle} deg), param {AUTO_PARAM_ID} "
+                    "(auto exposure)"
+                )
+                size = camera.capture_auto(
+                    output_path=output_path,
+                    timeout=args.capture_timeout,
+                    save_media=args.save_media,
+                    fast_shutter=args.fast_shutter,
+                )
+                captured_at = timestamp()
+                capture_record = build_capture_record(
+                    session_id=session_id,
+                    sequence=sequence,
+                    class_id=class_id,
+                    sample_id=sample_id,
+                    light_id=light_id,
+                    light_position=light_position,
+                    light_intensity=light_value,
+                    light_cct=light_cct,
+                    view_id=view_id,
+                    angle_degrees=angle,
+                    param_id=AUTO_PARAM_ID,
+                    aperture="auto",
+                    iso="auto",
+                    shutter_speed="auto",
+                    exposure_mode="auto",
+                    output_dir=output_dir,
+                    output_path=output_path,
+                    captured_at=captured_at,
+                    size_bytes=size,
+                )
+                append_jsonl_record(map_dir / "captures.jsonl", capture_record)
+                print(f"Saved {output_path.relative_to(output_dir)} ({size:,} bytes)")
 
             for param_item in param_plan:
                 param_id = int(param_item["param_id"])
@@ -1227,7 +1346,6 @@ async def capture_one_class_id(
                     output_path=output_path,
                     timeout=args.capture_timeout,
                     save_media=args.save_media,
-                    print_timing=args.print_timing,
                     fast_shutter=args.fast_shutter,
                 )
                 captured_at = timestamp()
@@ -1246,6 +1364,7 @@ async def capture_one_class_id(
                     aperture=aperture,
                     iso=iso,
                     shutter_speed=shutter,
+                    exposure_mode="manual",
                     output_dir=output_dir,
                     output_path=output_path,
                     captured_at=captured_at,
@@ -1255,12 +1374,27 @@ async def capture_one_class_id(
                 print(f"Saved {output_path.relative_to(output_dir)} ({size:,} bytes)")
 
         if args.views > 1:
-            start = time.monotonic()
             turntable.rotate(args.view_step)
-            if args.print_timing:
-                print(f"  timing turntable_rotate_return: {time.monotonic() - start:.4f}s")
 
-    print(f"Class ID {class_id} capture complete.")
+    completed_at = timestamp()
+    end_monotonic = time.monotonic()
+    object_elapsed_seconds = end_monotonic - object_start_monotonic
+    capture_elapsed_seconds = end_monotonic - capture_start_monotonic
+    update_sample_timing(
+        dataset_map,
+        class_id,
+        sample_id,
+        session_id,
+        capture_started_at,
+        completed_at,
+        object_elapsed_seconds,
+        capture_elapsed_seconds,
+    )
+    save_dataset_map(map_dir, dataset_map)
+    print(
+        f"Class ID {class_id} capture complete in {format_duration(object_elapsed_seconds)} "
+        f"(capture loop {format_duration(capture_elapsed_seconds)})."
+    )
 
 
 async def run_capture(args: argparse.Namespace) -> None:
@@ -1279,6 +1413,8 @@ async def run_capture(args: argparse.Namespace) -> None:
 
     lighting_plan = build_lighting_plan(dataset_map, args)
     view_plan = build_view_plan(dataset_map, args)
+    if not args.skip_auto_exposure:
+        ensure_auto_param_entry(dataset_map)
     param_plan = build_param_plan(dataset_map, args)
     save_dataset_map(map_dir, dataset_map)
     light_controller = make_light_controller(args)
