@@ -12,6 +12,7 @@
 #   4. Stop the script, move the light, rerun with a new --light-position.
 #
 # Mapping layout:
+#   images are stored as <output-dir>/lXXX/cXXX/sYYY/vXXX/pXXX.jpg
 #   <output-dir>/maps/parameters.json  cumulative global parameter map
 #     samples[] includes per-object timing: started_at, completed_at,
 #     object_elapsed_seconds, capture_elapsed_seconds
@@ -72,6 +73,12 @@ exit 0
 # =========================
 # Dataset Cleanup
 # =========================
+
+# Delete old pre-light-top-layout folders. This requires sudo because some folders are root-owned.
+# sudo rm -rf dataset/c000 dataset/c001 dataset/c002 dataset/c003
+
+# Reset maps after deleting all old-layout data.
+# python -c 'import json, time; from pathlib import Path; p=Path("dataset/maps/parameters.json"); d=json.loads(p.read_text()); d["classes"]=[]; d["samples"]=[]; d["lights"]=[]; d["views"]=[]; d["params"]=[]; d["updated_at"]=time.strftime("%Y-%m-%dT%H:%M:%S%z"); p.write_text(json.dumps(d, indent=2, sort_keys=True)+"\n"); Path("dataset/maps/captures.jsonl").write_text("")'
 
 # Preview removing one bad sample and its map records.
 # python capture_util/remove_records.py --output-dir dataset --class-id 1 --sample-id 2

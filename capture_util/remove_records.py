@@ -112,40 +112,37 @@ def image_paths_from_records(
 
 def directory_paths_from_filters(output_dir: Path, args: argparse.Namespace) -> set[Path]:
     paths: set[Path] = set()
-    class_dirs = (
-        [output_dir / format_id("c", args.class_id)]
-        if args.class_id is not None
-        else sorted(output_dir.glob("c[0-9][0-9][0-9]"))
+    light_dirs = (
+        [output_dir / format_id("l", args.light_id)]
+        if args.light_id is not None
+        else sorted(output_dir.glob("l[0-9][0-9][0-9]"))
     )
+    for light_dir in light_dirs:
+        class_dirs = (
+            [light_dir / format_id("c", args.class_id)]
+            if args.class_id is not None
+            else sorted(light_dir.glob("c[0-9][0-9][0-9]"))
+        )
+        for class_dir in class_dirs:
+            if args.sample_id is not None:
+                sample_dirs = [class_dir / format_id("s", args.sample_id)]
+            else:
+                sample_dirs = sorted(class_dir.glob("s[0-9][0-9][0-9]"))
 
-    for class_dir in class_dirs:
-        if args.sample_id is not None:
-            sample_dirs = [class_dir / format_id("s", args.sample_id)]
-        else:
-            sample_dirs = sorted(class_dir.glob("s[0-9][0-9][0-9]"))
-
-        for sample_dir in sample_dirs:
-            if args.light_id is None and args.view_id is None and args.param_id is None:
-                if args.class_id is not None and args.sample_id is None:
-                    paths.add(class_dir)
-                elif args.sample_id is not None:
-                    paths.add(sample_dir)
-                continue
-
-            light_dirs = (
-                [sample_dir / format_id("l", args.light_id)]
-                if args.light_id is not None
-                else sorted(sample_dir.glob("l[0-9][0-9][0-9]"))
-            )
-            for light_dir in light_dirs:
+            for sample_dir in sample_dirs:
                 if args.view_id is None and args.param_id is None:
-                    paths.add(light_dir)
+                    if args.class_id is not None and args.sample_id is None:
+                        paths.add(class_dir)
+                    elif args.sample_id is not None:
+                        paths.add(sample_dir)
+                    elif args.light_id is not None:
+                        paths.add(light_dir)
                     continue
 
                 view_dirs = (
-                    [light_dir / format_id("v", args.view_id)]
+                    [sample_dir / format_id("v", args.view_id)]
                     if args.view_id is not None
-                    else sorted(light_dir.glob("v[0-9][0-9][0-9]"))
+                    else sorted(sample_dir.glob("v[0-9][0-9][0-9]"))
                 )
                 for view_dir in view_dirs:
                     if args.param_id is None:
@@ -173,6 +170,26 @@ def item_id(item: dict[str, Any], key: str) -> int | None:
     return None
 
 
+def sample_light_ids(sample: dict[str, Any]) -> list[int]:
+    light_ids = sample.get("light_ids")
+    if isinstance(light_ids, list):
+        return [int(value) for value in light_ids if isinstance(value, int) or str(value).isdigit()]
+    light_id = sample.get("light_id")
+    if isinstance(light_id, int):
+        return [light_id]
+    if isinstance(light_id, str) and light_id.isdigit():
+        return [int(light_id)]
+    return []
+
+
+def capture_sample_keys(captures: list[dict[str, Any]]) -> set[tuple[int, int, int]]:
+    return {
+        (int(record["light_id"]), int(record["class_id"]), int(record["sample_id"]))
+        for record in captures
+        if "light_id" in record and "class_id" in record and "sample_id" in record
+    }
+
+
 def prune_parameters(
     parameters: dict[str, Any],
     remaining_captures: list[dict[str, Any]],
@@ -180,27 +197,20 @@ def prune_parameters(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     used_classes = {int(record["class_id"]) for record in remaining_captures if "class_id" in record}
-    used_samples = {
-        (int(record["class_id"]), int(record["sample_id"]))
-        for record in remaining_captures
-        if "class_id" in record and "sample_id" in record
-    }
+    used_samples = capture_sample_keys(remaining_captures)
     used_lights = {int(record["light_id"]) for record in remaining_captures if "light_id" in record}
     used_views = {int(record["view_id"]) for record in remaining_captures if "view_id" in record}
     used_params = {int(record["param_id"]) for record in remaining_captures if "param_id" in record}
     removed_classes = {int(record["class_id"]) for record in removed_captures if "class_id" in record}
-    removed_samples = {
-        (int(record["class_id"]), int(record["sample_id"]))
-        for record in removed_captures
-        if "class_id" in record and "sample_id" in record
-    }
+    removed_samples = capture_sample_keys(removed_captures)
     removed_lights = {int(record["light_id"]) for record in removed_captures if "light_id" in record}
     removed_views = {int(record["view_id"]) for record in removed_captures if "view_id" in record}
     removed_params = {int(record["param_id"]) for record in removed_captures if "param_id" in record}
     if args.class_id is not None:
         removed_classes.add(args.class_id)
     if args.class_id is not None and args.sample_id is not None:
-        removed_samples.add((args.class_id, args.sample_id))
+        if args.light_id is not None:
+            removed_samples.add((args.light_id, args.class_id, args.sample_id))
     if args.light_id is not None:
         removed_lights.add(args.light_id)
     if args.view_id is not None:
@@ -249,11 +259,16 @@ def should_keep_item(
 
 def should_keep_sample(
     sample: dict[str, Any],
-    used_samples: set[tuple[int, int]],
-    removed_samples: set[tuple[int, int]],
+    used_samples: set[tuple[int, int, int]],
+    removed_samples: set[tuple[int, int, int]],
 ) -> bool:
-    key = (item_id(sample, "class_id"), item_id(sample, "sample_id"))
-    return key in used_samples or key not in removed_samples
+    class_id = item_id(sample, "class_id")
+    sample_id = item_id(sample, "sample_id")
+    light_ids = sample_light_ids(sample)
+    if not light_ids:
+        return True
+    keys = {(light_id, class_id, sample_id) for light_id in light_ids}
+    return bool(keys & used_samples) or not bool(keys & removed_samples)
 
 
 def updated_sample(
@@ -262,10 +277,12 @@ def updated_sample(
 ) -> dict[str, Any]:
     class_id = item_id(sample, "class_id")
     sample_id = item_id(sample, "sample_id")
+    light_ids = set(sample_light_ids(sample))
     total_captures = sum(
         1
         for record in remaining_captures
         if record.get("class_id") == class_id and record.get("sample_id") == sample_id
+        and (not light_ids or record.get("light_id") in light_ids)
     )
     sample = dict(sample)
     sample["total_captures"] = total_captures
@@ -314,7 +331,12 @@ def remove_paths(paths: set[Path], output_dir: Path) -> tuple[int, int]:
 def prune_empty_dirs(output_dir: Path) -> int:
     removed = 0
     candidates = sorted(
-        [path for path in output_dir.glob("c*/**") if path.is_dir()],
+        [
+            path
+            for pattern in ("l*/**",)
+            for path in output_dir.glob(pattern)
+            if path.is_dir()
+        ],
         key=lambda item: len(item.parts),
         reverse=True,
     )

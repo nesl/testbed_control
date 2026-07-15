@@ -168,9 +168,9 @@ def build_output_path(
 ) -> Path:
     return (
         output_dir
+        / format_id("l", light_id)
         / format_id("c", class_id)
         / format_id("s", sample_id)
-        / format_id("l", light_id)
         / format_id("v", view_id)
         / f"{format_id('p', param_id)}.jpg"
     )
@@ -290,50 +290,98 @@ def ensure_class_entry(dataset_map: dict[str, object], class_id: int) -> None:
     )
 
 
-def sample_ids_from_dirs(output_dir: Path, class_id: int) -> list[int]:
-    class_dir = output_dir / format_id("c", class_id)
-    if not class_dir.exists():
-        return []
+def sample_ids_from_dirs(output_dir: Path, light_id: int, class_id: int) -> list[int]:
+    new_class_dir = output_dir / format_id("l", light_id) / format_id("c", class_id)
     sample_ids = []
-    for path in class_dir.iterdir():
-        if path.is_dir() and path.name.startswith("s") and path.name[1:].isdigit():
-            sample_ids.append(int(path.name[1:]))
+    if new_class_dir.exists():
+        for path in new_class_dir.iterdir():
+            if path.is_dir() and path.name.startswith("s") and path.name[1:].isdigit():
+                sample_ids.append(int(path.name[1:]))
     return sample_ids
 
 
-def next_sample_id(dataset_map: dict[str, object], output_dir: Path, class_id: int) -> int:
+def sample_light_ids(sample: dict[str, object]) -> list[int]:
+    light_ids = sample.get("light_ids")
+    if isinstance(light_ids, list):
+        return [int(value) for value in light_ids if isinstance(value, int) or str(value).isdigit()]
+    light_id = sample.get("light_id")
+    if isinstance(light_id, int):
+        return [light_id]
+    if isinstance(light_id, str) and light_id.isdigit():
+        return [int(light_id)]
+    return []
+
+
+def next_sample_id(
+    dataset_map: dict[str, object],
+    output_dir: Path,
+    class_id: int,
+    light_ids: list[int],
+) -> int:
+    light_id_set = set(light_ids)
     samples = map_items(dataset_map, "samples")
-    map_sample_ids = [
-        int(item["sample_id"])
-        for item in samples
-        if int(item.get("class_id", -1)) == class_id and str(item.get("sample_id", "")).isdigit()
+    map_sample_ids = []
+    for item in samples:
+        if int(item.get("class_id", -1)) != class_id:
+            continue
+        if not str(item.get("sample_id", "")).isdigit():
+            continue
+        item_light_ids = set(sample_light_ids(item))
+        if item_light_ids and item_light_ids.isdisjoint(light_id_set):
+            continue
+        if not item_light_ids:
+            continue
+        map_sample_ids.append(int(item["sample_id"]))
+    dir_sample_ids = []
+    for light_id in light_ids:
+        dir_sample_ids.extend(sample_ids_from_dirs(output_dir, light_id, class_id))
+    return max([*map_sample_ids, *dir_sample_ids], default=0) + 1
+
+
+def light_sample_dirs(output_dir: Path, light_ids: list[int], class_id: int, sample_id: int) -> list[Path]:
+    return [
+        output_dir / format_id("l", light_id) / format_id("c", class_id) / format_id("s", sample_id)
+        for light_id in light_ids
     ]
-    if map_sample_ids:
-        return max(map_sample_ids) + 1
-    return max(sample_ids_from_dirs(output_dir, class_id), default=0) + 1
+
+
+def sample_folder_text(output_dir: Path, light_ids: list[int], class_id: int, sample_id: int) -> str:
+    paths = light_sample_dirs(output_dir, light_ids, class_id, sample_id)
+    if len(paths) == 1:
+        return str(paths[0])
+    return ", ".join(str(path) for path in paths)
 
 
 def append_sample_entry(
     dataset_map: dict[str, object],
     class_id: int,
     sample_id: int,
+    light_ids: list[int],
     session_id: str,
     total_captures: int,
     started_at: str,
 ) -> None:
-    map_items(dataset_map, "samples").append(
-        {
-            "class_id": class_id,
-            "sample_id": sample_id,
-            "class_folder": format_id("c", class_id),
-            "sample_folder": format_id("s", sample_id),
-            "session_id": session_id,
-            "created_at": started_at,
-            "started_at": started_at,
-            "total_captures": total_captures,
-        }
-    )
+    entry = {
+        "class_id": class_id,
+        "sample_id": sample_id,
+        "light_ids": light_ids,
+        "light_folders": [format_id("l", light_id) for light_id in light_ids],
+        "class_folder": format_id("c", class_id),
+        "sample_folder": format_id("s", sample_id),
+        "session_id": session_id,
+        "created_at": started_at,
+        "started_at": started_at,
+        "total_captures": total_captures,
+    }
+    if len(light_ids) == 1:
+        entry["light_id"] = light_ids[0]
+        entry["light_folder"] = format_id("l", light_ids[0])
+    map_items(dataset_map, "samples").append(entry)
 
+
+def validate_light_intensity(intensity: int) -> None:
+    if intensity < 0 or intensity > 1000:
+        raise ValueError(f"Light intensity must be in [0, 1000], got {intensity}.")
 
 def update_sample_timing(
     dataset_map: dict[str, object],
@@ -363,12 +411,6 @@ def update_sample_timing(
     raise RuntimeError(
         f"Could not update timing for class {class_id}, sample {sample_id}, session {session_id}."
     )
-
-
-def validate_light_intensity(intensity: int) -> None:
-    if intensity < 0 or intensity > 1000:
-        raise ValueError(f"Light intensity must be in [0, 1000], got {intensity}.")
-
 
 def get_or_create_light_id(
     dataset_map: dict[str, object],
@@ -934,7 +976,13 @@ class SonyCameraController:
         capture_fast = fast_shutter and not changed_to_manual
         if fast_shutter and changed_to_manual:
             print("Using normal shutter for first manual capture after auto exposure; fast shutter resumes after this.")
-        return self._capture_to_path(output_path, timeout, save_media, capture_fast)
+        try:
+            return self._capture_to_path(output_path, timeout, save_media, capture_fast)
+        except RuntimeError as exc:
+            if not changed_to_manual or "timed out waiting for image" not in str(exc):
+                raise
+            print("First manual capture after auto exposure timed out; retrying once with normal shutter.")
+            return self._capture_to_path(output_path, timeout, save_media, fast_shutter=False)
 
     def capture_auto(
         self,
@@ -990,13 +1038,62 @@ class SonyCameraController:
         mode_value = int(mode)
         if self._last_exposure_mode == mode_value:
             return False
-        self.camera.set_exposure_mode(mode)
-        self._wait_for_setting(self.DeviceProperty.EXPOSURE_MODE, mode_value, label)
+        attempts = 4
+        last_actual = None
+        for attempt in range(1, attempts + 1):
+            self.camera.set_exposure_mode(mode)
+            try:
+                self._wait_for_setting(
+                    self.DeviceProperty.EXPOSURE_MODE,
+                    mode_value,
+                    label,
+                    timeout=5.0 + attempt * 2.0,
+                )
+                break
+            except RuntimeError:
+                last_actual = self.camera.get_property(self.DeviceProperty.EXPOSURE_MODE).current_value
+                if attempt == attempts:
+                    raise RuntimeError(
+                        f"Camera did not apply {label} after {attempts} attempts: "
+                        f"expected 0x{mode_value:X}, got {self._format_exposure_mode(last_actual)}"
+                    )
+                print(
+                    f"Camera still in {self._format_exposure_mode(last_actual)} while setting {label}; "
+                    f"retrying ({attempt}/{attempts})..."
+                )
+                self._settle_before_exposure_mode_retry()
         self._last_exposure_mode = mode_value
         self._last_iso = None
         self._last_aperture = None
         self._last_shutter = None
         return True
+
+    def _settle_before_exposure_mode_retry(self) -> None:
+        try:
+            self.camera._wait_for_liveview()
+        except Exception:
+            pass
+        try:
+            self.camera._wait_for_shooting_file_info_clear(timeout=5.0)
+        except Exception:
+            pass
+        try:
+            self.camera.set_mode("still")
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+    def _format_exposure_mode(self, value) -> str:
+        if value is None:
+            return "unknown"
+        try:
+            numeric_value = int(value)
+        except (TypeError, ValueError):
+            return repr(value)
+        for name, mode in getattr(self.ExposureMode, "__members__", {}).items():
+            if int(mode) == numeric_value:
+                return f"{name} (0x{numeric_value:X})"
+        return f"0x{numeric_value:X}"
 
     def _auto_exposure_mode(self):
         for name in ("PROGRAM_AUTO", "PROGRAM", "AUTO", "P", "INTELLIGENT_AUTO"):
@@ -1214,14 +1311,16 @@ async def capture_one_class_id(
     params_per_view = len(param_plan) + (1 if auto_exposure_enabled else 0)
     total_captures = len(lighting_plan) * len(view_plan) * params_per_view
     ensure_class_entry(dataset_map, class_id)
-    sample_id = next_sample_id(dataset_map, output_dir, class_id)
-    sample_dir = output_dir / format_id("c", class_id) / format_id("s", sample_id)
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    restore_owner(sample_dir)
+    light_ids = [int(item["light_id"]) for item in lighting_plan]
+    sample_id = next_sample_id(dataset_map, output_dir, class_id, light_ids)
+    for sample_dir in light_sample_dirs(output_dir, light_ids, class_id, sample_id):
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        restore_owner(sample_dir)
     append_sample_entry(
         dataset_map,
         class_id,
         sample_id,
+        light_ids,
         session_id,
         total_captures,
         object_started_at,
@@ -1231,7 +1330,7 @@ async def capture_one_class_id(
     print(f"\nClass ID: {class_id}")
     print(f"Sample: {sample_id}")
     print(f"Session: {session_id}")
-    print(f"Sample folder: {sample_dir}")
+    print(f"Sample folder: {sample_folder_text(output_dir, light_ids, class_id, sample_id)}")
     print(f"Capture index: {map_dir / 'captures.jsonl'}")
     print(f"Total captures: {total_captures}")
     print(
