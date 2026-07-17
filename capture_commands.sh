@@ -71,6 +71,47 @@ exit 0
 
 
 # =========================
+# Manual SAM Crop Pipeline
+# =========================
+
+# Step 1: Generate SAM candidate masks from l001/<class>/<sample>/<view>/p000.jpg.
+# /mnt/hdd1/yuyang/install/conda_envs/adapcam/bin/python -u scripts/crop_test_ver3_by_p000_sam.py --mode prepare-candidates --sam-checkpoint models/sam_vit_b_01ec64.pth --device auto --overwrite
+
+# Step 2: Copy the selection template, then edit candidate_ids by inspecting dataset/test_ver3_cropped/candidate_qc/*.jpg.
+# cp dataset/test_ver3_cropped/manual_selections.template.json dataset/test_ver3_cropped/manual_selections.json
+
+# Step 3: Dry-run the manual selections and inspect dataset/test_ver3_cropped/crop_qc/*.jpg.
+# /mnt/hdd1/yuyang/install/conda_envs/adapcam/bin/python -u scripts/crop_test_ver3_by_p000_sam.py --mode crop --sam-checkpoint models/sam_vit_b_01ec64.pth --manual-selections dataset/test_ver3_cropped/manual_selections.json --dry-run --overwrite
+
+# Step 4: Write the cropped dataset after QC looks right.
+# /mnt/hdd1/yuyang/install/conda_envs/adapcam/bin/python -u scripts/crop_test_ver3_by_p000_sam.py --mode crop --sam-checkpoint models/sam_vit_b_01ec64.pth --manual-selections dataset/test_ver3_cropped/manual_selections.json --overwrite
+
+
+# =========================
+# Downstream Evaluation / Analysis
+# =========================
+
+# Optional: create/edit class labels before the first downstream run.
+# cp dataset/test_ver3_cropped/class_labels.template.json dataset/test_ver3_cropped/class_labels.json
+
+# Run ResNet50 + OpenCLIP top-1 downstream evaluation. Writes downstream_eval/image_results.jsonl.
+# /mnt/hdd1/yuyang/install/conda_envs/adapcam/bin/python -u scripts/evaluate_downstream.py --dataset-root dataset/test_ver3_cropped --class-labels dataset/test_ver3_cropped/class_labels.json --models resnet50,openclip --device auto
+
+# Aggregate correct count / accuracy by parameter and by object.
+# /mnt/hdd1/yuyang/install/conda_envs/adapcam/bin/python -u scripts/analysis/param_correct_counts.py --results dataset/test_ver3_cropped/downstream_eval/image_results.jsonl
+
+# Measure overlap of successful parameters across lighting pairs.
+# /mnt/hdd1/yuyang/install/conda_envs/adapcam/bin/python -u scripts/analysis/lighting_overlap.py --results dataset/test_ver3_cropped/downstream_eval/image_results.jsonl
+
+# AE baseline: write one CSV with by-lighting rows and overall rows for param_id=0 / auto exposure.
+# /mnt/hdd1/yuyang/install/conda_envs/adapcam/bin/python -u scripts/analysis/ae_baseline.py --results dataset/test_ver3_cropped/downstream_eval/image_results.jsonl --output-file dataset/test_ver3_cropped/analysis/ae_baseline.csv
+
+# Optional variants: exclude AE param from parameter count and lighting overlap analyses.
+# /mnt/hdd1/yuyang/install/conda_envs/adapcam/bin/python -u scripts/analysis/param_correct_counts.py --results dataset/test_ver3_cropped/downstream_eval/image_results.jsonl --exclude-auto-param
+# /mnt/hdd1/yuyang/install/conda_envs/adapcam/bin/python -u scripts/analysis/lighting_overlap.py --results dataset/test_ver3_cropped/downstream_eval/image_results.jsonl --exclude-auto-param
+
+
+# =========================
 # Dataset Cleanup
 # =========================
 
