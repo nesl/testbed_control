@@ -21,6 +21,7 @@ from torchvision.models import ResNet50_Weights, resnet50
 DEFAULT_DATASET_ROOT = Path("dataset/test_ver3_cropped")
 DEFAULT_OUTPUT_DIR = DEFAULT_DATASET_ROOT / "downstream_eval"
 VALID_MODELS = {"resnet50", "openclip"}
+OPENCLIP_CLASS_SPACES = {"configured", "imagenet"}
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,16 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def openclip_class_space(value: str) -> str:
+    parsed = value.strip().lower()
+    if parsed not in OPENCLIP_CLASS_SPACES:
+        raise argparse.ArgumentTypeError(
+            f"unknown OpenCLIP class space: {value}; valid choices are "
+            f"{', '.join(sorted(OPENCLIP_CLASS_SPACES))}"
+        )
     return parsed
 
 
@@ -283,26 +294,94 @@ def evaluate_resnet50(
     return results
 
 
+def openclip_candidates(
+    class_labels: dict[str, dict[str, Any]],
+    class_space: str,
+) -> list[dict[str, Any]]:
+    class_ids = sorted(class_labels, key=lambda value: int(value) if value.isdigit() else value)
+
+    if class_space == "configured":
+        return [
+            {
+                "candidate_id": class_id,
+                "name": class_labels[class_id]["name"],
+                "target_class_id": class_id,
+                "prompts": class_labels[class_id]["openclip_prompts"],
+            }
+            for class_id in class_ids
+        ]
+
+    categories = list(ResNet50_Weights.DEFAULT.meta["categories"])
+    labels_by_class = validate_imagenet_labels(class_labels, categories)
+    target_by_label: dict[str, str] = {}
+    for class_id in class_ids:
+        for label in labels_by_class[class_id]:
+            previous = target_by_label.get(label)
+            if previous is not None:
+                raise ValueError(
+                    f"ImageNet label {label!r} is assigned to both class {previous} and {class_id}"
+                )
+            target_by_label[label] = class_id
+
+    candidates = [
+        {
+            "candidate_id": f"imagenet:{index}",
+            "name": label,
+            "target_class_id": target_by_label.get(label),
+            "prompts": [f"a photo of a {label}"],
+        }
+        for index, label in enumerate(categories)
+    ]
+    for class_id in class_ids:
+        if not labels_by_class[class_id]:
+            candidates.append(
+                {
+                    "candidate_id": f"custom:{class_id}",
+                    "name": class_labels[class_id]["name"],
+                    "target_class_id": class_id,
+                    "prompts": class_labels[class_id]["openclip_prompts"],
+                }
+            )
+    return candidates
+
+
 def openclip_class_features(
     class_labels: dict[str, dict[str, Any]],
     model,
     tokenizer,
     device: torch.device,
-) -> tuple[list[str], list[str], torch.Tensor]:
-    class_ids = sorted(class_labels, key=lambda value: int(value) if value.isdigit() else value)
-    class_names = [class_labels[class_id]["name"] for class_id in class_ids]
-    features: list[torch.Tensor] = []
+    class_space: str,
+    text_batch_size: int,
+) -> tuple[list[dict[str, Any]], torch.Tensor]:
+    candidates = openclip_candidates(class_labels, class_space)
+    prompts: list[str] = []
+    prompt_owners: list[int] = []
+    for candidate_index, candidate in enumerate(candidates):
+        candidate_prompts = candidate["prompts"]
+        prompts.extend(candidate_prompts)
+        prompt_owners.extend([candidate_index] * len(candidate_prompts))
+
+    prompt_feature_batches: list[torch.Tensor] = []
 
     with torch.inference_mode():
-        for class_id in class_ids:
-            prompts = class_labels[class_id]["openclip_prompts"]
-            tokens = tokenizer(prompts).to(device)
+        for start in range(0, len(prompts), text_batch_size):
+            tokens = tokenizer(prompts[start : start + text_batch_size]).to(device)
             prompt_features = model.encode_text(tokens)
             prompt_features = prompt_features / prompt_features.norm(dim=-1, keepdim=True)
-            class_feature = prompt_features.mean(dim=0)
-            class_feature = class_feature / class_feature.norm()
-            features.append(class_feature)
-    return class_ids, class_names, torch.stack(features)
+            prompt_feature_batches.append(prompt_features)
+
+        all_prompt_features = torch.cat(prompt_feature_batches)
+        owner_indices = torch.tensor(prompt_owners, dtype=torch.long, device=device)
+        class_features = torch.zeros(
+            (len(candidates), all_prompt_features.shape[1]),
+            dtype=all_prompt_features.dtype,
+            device=device,
+        )
+        class_features.index_add_(0, owner_indices, all_prompt_features)
+        counts = torch.bincount(owner_indices, minlength=len(candidates)).to(class_features.dtype)
+        class_features = class_features / counts.unsqueeze(1)
+        class_features = class_features / class_features.norm(dim=-1, keepdim=True)
+    return candidates, class_features
 
 
 def evaluate_openclip(
@@ -312,6 +391,8 @@ def evaluate_openclip(
     device: torch.device,
     model_name: str,
     pretrained: str,
+    class_space: str,
+    text_batch_size: int,
 ) -> dict[int, dict[str, Any]]:
     import open_clip
 
@@ -322,11 +403,13 @@ def evaluate_openclip(
     )
     tokenizer = open_clip.get_tokenizer(model_name)
     model.eval()
-    class_ids, class_names, text_features = openclip_class_features(
+    candidates, text_features = openclip_class_features(
         class_labels,
         model,
         tokenizer,
         device,
+        class_space,
+        text_batch_size,
     )
 
     results: dict[int, dict[str, Any]] = {}
@@ -339,12 +422,15 @@ def evaluate_openclip(
             similarities = image_features @ text_features.T
             scores, indices = similarities.max(dim=1)
             for record, index, score in zip(batch_records, indices.detach().cpu().tolist(), scores.detach().cpu().tolist()):
-                predicted_class_id = class_ids[int(index)]
+                candidate = candidates[int(index)]
+                predicted_target_class_id = candidate["target_class_id"]
                 results[record.record_index] = {
-                    "top1_class_id": predicted_class_id,
-                    "top1_label": class_names[int(index)],
+                    "top1_candidate_id": candidate["candidate_id"],
+                    "top1_class_id": predicted_target_class_id or candidate["candidate_id"],
+                    "top1_target_class_id": predicted_target_class_id,
+                    "top1_label": candidate["name"],
                     "top1_score": float(score),
-                    "top1_correct": predicted_class_id == record.class_id,
+                    "top1_correct": predicted_target_class_id == record.class_id,
                 }
             processed += len(batch_records)
             print_progress("openclip", processed, total)
@@ -387,6 +473,8 @@ def write_results(
                     "resnet50_top1_label": resnet.get("top1_label"),
                     "resnet50_top1_correct": resnet.get("top1_correct"),
                     "openclip_top1_class_id": openclip.get("top1_class_id"),
+                    "openclip_top1_candidate_id": openclip.get("top1_candidate_id"),
+                    "openclip_top1_target_class_id": openclip.get("top1_target_class_id"),
                     "openclip_top1_label": openclip.get("top1_label"),
                     "openclip_top1_correct": openclip.get("top1_correct"),
                 }
@@ -406,6 +494,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-missing-images", action="store_true")
     parser.add_argument("--openclip-model", default="ViT-B-32")
     parser.add_argument("--openclip-pretrained", default="laion2b_s34b_b79k")
+    parser.add_argument(
+        "--openclip-class-space",
+        type=openclip_class_space,
+        default="configured",
+        help="Use configured semantic classes or the full ImageNet-1K label space.",
+    )
+    parser.add_argument("--openclip-text-batch-size", type=positive_int, default=256)
     return parser
 
 
@@ -431,6 +526,8 @@ def main() -> None:
             device,
             args.openclip_model,
             args.openclip_pretrained,
+            args.openclip_class_space,
+            args.openclip_text_batch_size,
         )
 
     output_path = output_dir / "image_results.jsonl"
