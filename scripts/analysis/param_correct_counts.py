@@ -26,6 +26,13 @@ def bool_accuracy(correct_count: int, n: int) -> float | None:
     return correct_count / n if n else None
 
 
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
 def first_meta(rows: list[dict[str, Any]]) -> dict[str, Any]:
     first = rows[0]
     return {
@@ -90,13 +97,26 @@ def aggregate_by_object_param(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     )
 
 
-def distribution(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def distribution(
+    rows: list[dict[str, Any]],
+    max_correct_count: int | None = None,
+) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for model in MODELS:
         model_rows = [row for row in rows if row["model"] == model]
         if not model_rows:
             continue
-        max_count = max(int(row["n_images"]) for row in model_rows)
+        observed_max = max(int(row["correct_count"]) for row in model_rows)
+        max_count = (
+            max_correct_count
+            if max_correct_count is not None
+            else max(int(row["n_images"]) for row in model_rows)
+        )
+        if max_count < observed_max:
+            raise ValueError(
+                f"--max-correct-count={max_count} is below the observed "
+                f"correct_count={observed_max} for {model}"
+            )
         counts = Counter(int(row["correct_count"]) for row in model_rows)
         for correct_count in range(max_count + 1):
             output.append(
@@ -135,6 +155,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--results", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--exclude-auto-param", action="store_true")
+    parser.add_argument(
+        "--max-correct-count",
+        type=non_negative_int,
+        help="Emit correct-count distribution bins from 0 through this value.",
+    )
     return parser
 
 
@@ -159,7 +184,7 @@ def main() -> None:
     write_csv(
         output_dir / "correct_count_distribution.csv",
         ["model", "correct_count", "n_params"],
-        distribution(by_param),
+        distribution(by_param, args.max_correct_count),
     )
     write_csv(
         output_dir / "correct_count_distribution_by_object.csv",
