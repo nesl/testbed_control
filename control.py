@@ -994,6 +994,11 @@ class SonyCameraController:
         if self.camera is None:
             raise RuntimeError("Camera is not connected.")
         self._set_exposure_mode(self._auto_exposure_mode(), "auto exposure mode")
+        auto_iso_code = self._auto_iso_code()
+        if self._last_iso != auto_iso_code:
+            self.camera.set_iso(auto_iso_code)
+            self._wait_for_setting(self.DeviceProperty.ISO, auto_iso_code, "ISO AUTO")
+            self._last_iso = auto_iso_code
         return self._capture_to_path(output_path, timeout, save_media, fast_shutter=False)
 
     def _capture_to_path(
@@ -1117,6 +1122,12 @@ class SonyCameraController:
             raise ValueError(f"ISO {value} is not supported by this camera.")
         return code
 
+    def _auto_iso_code(self) -> int:
+        code = self._reverse_table(self.iso_table).get("AUTO")
+        if code is None:
+            raise RuntimeError("ISO AUTO is not supported by this camera.")
+        return code
+
     def _aperture_code(self, value: float) -> int:
         label = f"F{value:g}".upper()
         code = self._reverse_table(self.aperture_table).get(label)
@@ -1220,6 +1231,11 @@ def parse_args() -> argparse.Namespace:
         help="Do not capture the p000 auto-exposure image before each manual parameter sweep.",
     )
     parser.add_argument(
+        "--auto-exposure-only",
+        action="store_true",
+        help="Capture only p000 auto-exposure images and skip the manual parameter sweep.",
+    )
+    parser.add_argument(
         "--fast-shutter",
         action="store_true",
         help="Use pysonycam's fast shutter sequence to reduce S1/S2 trigger delay.",
@@ -1241,6 +1257,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--views must be at least 1.")
     if args.start_delay_seconds < 0:
         raise ValueError("--start-delay-seconds must be >= 0.")
+    if args.auto_exposure_only and args.skip_auto_exposure:
+        raise ValueError("--auto-exposure-only cannot be combined with --skip-auto-exposure.")
 
 
 def resolve_turntable_port(port: str) -> str:
@@ -1315,7 +1333,10 @@ async def capture_one_class_id(
     sample_id = next_sample_id(dataset_map, output_dir, class_id, light_ids)
     for sample_dir in light_sample_dirs(output_dir, light_ids, class_id, sample_id):
         sample_dir.mkdir(parents=True, exist_ok=True)
-        restore_owner(sample_dir)
+        current_dir = sample_dir
+        while current_dir != output_dir:
+            restore_owner(current_dir)
+            current_dir = current_dir.parent
     append_sample_entry(
         dataset_map,
         class_id,
@@ -1333,12 +1354,18 @@ async def capture_one_class_id(
     print(f"Sample folder: {sample_folder_text(output_dir, light_ids, class_id, sample_id)}")
     print(f"Capture index: {map_dir / 'captures.jsonl'}")
     print(f"Total captures: {total_captures}")
+    if args.auto_exposure_only:
+        plan_detail = "auto exposure only"
+    else:
+        plan_detail = (
+            f"{len(param_plan)} manual parameter"
+            f"{' + auto exposure' if auto_exposure_enabled else ''}"
+        )
     print(
         "Plan: "
         f"{len(lighting_plan)} lighting x "
         f"{len(view_plan)} views x "
-        f"{len(param_plan)} manual parameter"
-        f"{' + auto exposure' if auto_exposure_enabled else ''}"
+        f"{plan_detail}"
     )
     if args.start_delay_seconds > 0:
         print(f"Starting capture in {args.start_delay_seconds:g} seconds...")
@@ -1514,7 +1541,7 @@ async def run_capture(args: argparse.Namespace) -> None:
     view_plan = build_view_plan(dataset_map, args)
     if not args.skip_auto_exposure:
         ensure_auto_param_entry(dataset_map)
-    param_plan = build_param_plan(dataset_map, args)
+    param_plan = [] if args.auto_exposure_only else build_param_plan(dataset_map, args)
     save_dataset_map(map_dir, dataset_map)
     light_controller = make_light_controller(args)
     turntable_controller = make_turntable_controller(args)

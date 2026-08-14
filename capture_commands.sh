@@ -144,6 +144,26 @@ exit 0
 
 
 # =========================
+# Auto-exposure-only Recapture
+# =========================
+
+# Safest way to recapture the existing 15 AE images: write them to a separate
+# dataset so the original images and maps stay untouched. For each command,
+# enter these five objects at the prompt, then enter q:
+#   0, 1 (first object), 1 (second object), 2, 3
+# Keep the two class-1 objects in the same order for every lighting condition.
+
+# 1/3: reflect lighting, intensity 10. The new output directory must be empty/nonexistent.
+# sonycam control.py --capture-mode fresh --output-dir dataset/ae_recapture_20260721 --light-position reflect --light-intensities 10 --views 1 --auto-exposure-only --skip-turntable --fast-shutter
+
+# 2/3: normal lighting, intensity 300.
+# sonycam control.py --capture-mode append --output-dir dataset/ae_recapture_20260721 --light-position normal --light-intensities 300 --views 1 --auto-exposure-only --skip-turntable --fast-shutter
+
+# 3/3: face lighting, intensity 1000.
+# sonycam control.py --capture-mode append --output-dir dataset/ae_recapture_20260721 --light-position face --light-intensities 1000 --views 1 --auto-exposure-only --skip-turntable --fast-shutter
+
+
+# =========================
 # Fresh Dataset
 # =========================
 

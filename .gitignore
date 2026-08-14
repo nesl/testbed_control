@@ -3,3 +3,4 @@ sony_camera/captures/
 __pycache__
 dataset/
 models/
+data_replicate/
